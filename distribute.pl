@@ -65,6 +65,11 @@
 #    values of custom-vars and macros.
 # Modified 10 February 2025 by Jim Lippard to add more validation on config
 #    parsing and make syslock groups optional.
+# Modified 11 February 2025 by Jim Lippard to make dest: prohibited for
+#    packages.
+# Modified 16 February 2025 by Jim Lippard to fix bugs (can't check for
+#    file/dir existence before unveiling if unveiling has already begun;
+#    had double declaration of a variable passed as parameter to doas).
 
 use strict;
 use Archive::Tar;
@@ -256,20 +261,20 @@ if ($^O eq 'openbsd') {
     foreach $file (@files) {
 	if ($CONFIG{$file}{TYPE} eq 'plain') {
 	    $dir = dirname ($CONFIG{$file}{FILE});
-	    die "Cannot unveil $dir for plain file $file. $!\n" if (!-d $dir);
+#	    die "Cannot unveil $dir for plain file $file. $!\n" if (!-d $dir);
 	    unveil ($dir, 'r');
 	}
 	elsif ($CONFIG{$file}{TYPE} eq 'custom') {
 	    my $unveil_file;
 	    if (defined ($CONFIG{$file}{UNVEIL})) {
 		foreach $unveil_file (@{$CONFIG{$file}{UNVEIL}}) {
-		    die "Cannot unveil $unveil_file from \"unveil:\" for file $file. $!\n" if (!-e $unveil_file);
+#		    die "Cannot unveil $unveil_file from \"unveil:\" for file $file. $!\n" if (!-e $unveil_file);
 		    unveil ($unveil_file, 'r');
 		}
 	    }
 	    if (defined ($CONFIG{$file}{UNVEILEXEC})) {
 		foreach $unveil_file (@{$CONFIG{$file}{UNVEILEXEC}}) {
-		    die "Cannot unveil $unveil_file from \"unveil-exec:\" for file $file. $!\n" if (!-e $unveil_file);
+#		    die "Cannot unveil $unveil_file from \"unveil-exec:\" for file $file. $!\n" if (!-e $unveil_file);
 		    unveil ($unveil_file, 'rx');
 		}
 	    }
@@ -579,7 +584,10 @@ sub parse_config {
 		    $value = $SIGNIFY_PUB_KEY_NEXT if ($value eq '$SIGNIFY_PUB_KEY_NEXT');
 		}
 		$CONFIG{$current_name}{DEST} = $value;
-		$got_dest = 1; # optional
+		$got_dest = 1; # optional; forbidden for package type
+		if ($got_type && $CONFIG{$current_name}{TYPE} eq 'package') {
+		    die "A \"dest:\" field is not permitted for \"package\" type file \"$current_name\" on line $line_no. $_\n";
+		}
 	    }
 	    elsif ($field eq 'type') {
 		die "A \"type:\" field in global context on line $line_no. $_\n" if ($context == $GLOBAL_CONTEXT);
@@ -587,6 +595,9 @@ sub parse_config {
 		die "Invalid type \"$value\" on line $line_no. $_\n" if (!grep (/^$value$/, @TYPES));
 		$CONFIG{$current_name}{TYPE} = $value;
 		$got_type = 1;
+		if ($got_dest && $CONFIG{$current_name}{TYPE} eq 'package') {
+		    die "A \"dest:\" field is not permitted for \"package\" type file \"$current_name\" on line $line_no. $_\n";
+		}
 	    }
 	    elsif ($field eq 'syslock-groups') {
 		die "A \"syslock-groups:\" field in global context on line $line_no. $_\n" if ($context == $GLOBAL_CONTEXT);
@@ -794,7 +805,6 @@ sub _custom_validate_custom_vars {
 
     foreach $custom_var (keys (%req_opt_custom_vars)) {
 	die "Config is missing required custom variable \"$custom_var\" for $file.\n" if (!defined ($custom_vars{$custom_var}) && $req_opt_custom_vars{$custom_var} eq 'required');
-	print "DEBUG: ok: $custom_var=$custom_vars{$custom_var}\n";
     }
 
     # Make sure all variables are either required or optional.
@@ -806,7 +816,7 @@ sub _custom_validate_custom_vars {
 # Subroutine for custom doas.conf generation and distribution.
 sub _custom_doas_dot_conf {
     my ($temp_dir, $custom_vars, $dest_path, @hosts) = @_;
-    my (%custom_vars, $dest_path, $dest_file, $dest_dir, $host);
+    my (%custom_vars, $dest_file, $dest_dir, $host);
     # global: $have_fake_dir, %host_package_files
 
     my %REQ_OPT_CUSTOM_VARS = ('gendoas' => 'required');
