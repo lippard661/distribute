@@ -70,6 +70,8 @@
 # Modified 16 February 2025 by Jim Lippard to fix bugs (can't check for
 #    file/dir existence before unveiling if unveiling has already begun;
 #    had double declaration of a variable passed as parameter to doas).
+# Modified 26 April 2025 by Jim Lippard to fix custom pledge for ip-address
+#    and to use getaddrinfo/getnameinfo instead of inet_aton/inet_ntoa.
 
 use strict;
 use Archive::Tar;
@@ -147,7 +149,7 @@ my @custom_pledges;
 
 # for ip-address:
 # fattr for copy of pf.conf to preserve perms, doesn't seem to work
-my %CUSTOM_PLEDGE = ('ip-addr' => [ 'dns', 'fattr' ] );
+my %CUSTOM_PLEDGE = ('ip-address' => [ 'dns', 'fattr' ] );
 
 ### Variables.
 
@@ -916,7 +918,7 @@ sub _custom_ip_address {
 # external IP address via prompt.
 sub _custom_get_old_and_new_ip_addresses {
     my ($host_fqdn, $ipv6_name, $dns, $wan0, $wan1) = @_;
-    use Socket;
+    use Socket qw( :addrinfo SOCK_RAW );
     my ($old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1);
 
@@ -943,7 +945,12 @@ sub _custom_get_old_and_new_ip_addresses {
 	print "Distributing via v6 since v4 address doesn't have access.\n";
 	print "Warning: Must manually update DNS record via $dns.\n";
 	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
-	$old_address = inet_ntoa(inet_aton($host_fqdn));
+	my ($err, @res) = getaddrinfo ($host_fqdn, "", {socktype => SOCK_RAW});
+	die "Cannot getaddrinfo - $err" if $err;
+	while ( my $ai = shift @res ) {
+	    my ($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+	    die "Cannot getnameinfo - $err" if $err;
+	}
     }
     else {
 	print "Distributing via v4 (default) since v6 tunnel is down.\n";
