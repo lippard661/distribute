@@ -72,6 +72,8 @@
 #    had double declaration of a variable passed as parameter to doas).
 # Modified 26 April 2025 by Jim Lippard to fix custom pledge for ip-address
 #    and to use getaddrinfo/getnameinfo instead of inet_aton/inet_ntoa.
+# Modified 12 May 2025 by Jim Lippard to allow overriding of old IP in
+#    ip-address if the DNS record is inaccurate, fix bug in DNS lookup.
 
 use strict;
 use Archive::Tar;
@@ -921,6 +923,7 @@ sub _custom_get_old_and_new_ip_addresses {
     use Socket qw( :addrinfo SOCK_RAW );
     my ($old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1);
+    my ($err);
 
     $lc_wan0 = lc ($wan0);
 
@@ -948,8 +951,24 @@ sub _custom_get_old_and_new_ip_addresses {
 	my ($err, @res) = getaddrinfo ($host_fqdn, "", {socktype => SOCK_RAW});
 	die "Cannot getaddrinfo - $err" if $err;
 	while ( my $ai = shift @res ) {
-	    my ($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+	    ($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
 	    die "Cannot getnameinfo - $err" if $err;
+	}
+	while (1) {
+	    print "Old address: $old_address (return or enter correct): ";
+	    my $input_string = <STDIN>;
+	    chop ($input_string);
+	    if ($input_string =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+		$old_address = $input_string;
+		last;
+	    }
+	    elsif ($input_string eq '') {
+		$input_string = $old_address;
+		last;
+	    }
+	    else {
+		print "Invalid response \"$input_string\". Enter new IP or hit return.\n";
+	    }
 	}
     }
     else {
