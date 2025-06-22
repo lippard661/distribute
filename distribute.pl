@@ -74,6 +74,8 @@
 #    and to use getaddrinfo/getnameinfo instead of inet_aton/inet_ntoa.
 # Modified 12 May 2025 by Jim Lippard to allow overriding of old IP in
 #    ip-address if the DNS record is inaccurate, fix bug in DNS lookup.
+# Modified 22 June 2025 by Jim Lippard to allow each wan to have a separate
+#    DNS record.
 
 use strict;
 use Archive::Tar;
@@ -857,7 +859,8 @@ sub _custom_ip_address {
     
     my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required',
 			       'wan1' => 'optional',
-			       'host-fqdn' => 'required',
+			       'wan0-host-fqdn' => 'optional',
+			       'wan1-host-fqdn' => 'optional',
 			       'ipv6-name' => 'required',
 			       'dns' => 'required');
 
@@ -867,7 +870,7 @@ sub _custom_ip_address {
 
     my $CHMOD = '/bin/chmod';
     
-    ($old_address, $new_address) = &_custom_get_old_and_new_ip_addresses ($custom_vars{'host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});;
+    ($old_address, $new_address) = &_custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});;
     @source_paths = split (/,/, $file);
     @dest_paths = split (/,/, $dest);
 #	    $have_fake_dir = 1; done after call to this subroutine
@@ -918,11 +921,12 @@ sub _custom_ip_address {
 
 # Subroutine to get old external IP address from DNS and new
 # external IP address via prompt.
+# Assumes IPv6 is tunnel over wan0.
 sub _custom_get_old_and_new_ip_addresses {
-    my ($host_fqdn, $ipv6_name, $dns, $wan0, $wan1) = @_;
+    my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $dns, $wan0, $wan1) = @_;
     use Socket qw( :addrinfo SOCK_RAW );
     my ($old_address, $new_address, $wan0_or_wan1,
-	$lc_wan0, $lc_wan1);
+	$lc_wan0, $lc_wan1, $host_fqdn);
     my ($err);
 
     $lc_wan0 = lc ($wan0);
@@ -944,44 +948,40 @@ sub _custom_get_old_and_new_ip_addresses {
     }
 
     print "Warning: Must manually update /etc/faild.conf and /etc/reportnew/reportnew.conf.\n";
-    if ($wan0_or_wan1 eq $lc_wan1) {
-	print "Distributing via v6 since v4 address doesn't have access.\n";
-	print "Warning: Must manually update DNS record via $dns.\n";
-	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
-	my ($err, @res) = getaddrinfo ($host_fqdn, "", {socktype => SOCK_RAW});
-	die "Cannot getaddrinfo - $err" if $err;
-	while ( my $ai = shift @res ) {
-	    ($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
-	    die "Cannot getnameinfo - $err" if $err;
-	}
-	while (1) {
-	    print "Old address: $old_address (return or enter correct): ";
-	    my $input_string = <STDIN>;
-	    chop ($input_string);
-	    if ($input_string =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
-		$old_address = $input_string;
-		last;
-	    }
-	    elsif ($input_string eq '') {
-		$input_string = $old_address;
-		last;
-	    }
-	    else {
-		print "Invalid response \"$input_string\". Enter new IP or hit return.\n";
-	    }
-	}
-    }
-    else {
+    if ($wan0_or_wan1 eq $lc_wan0) {
+	# Assume wan0 has IPv6 tunnel.
 	print "Distributing via v4 (default) since v6 tunnel is down.\n";
 	print "Warning: Must manually update $ipv6_name tunnel.\n";
 	print "Warning: Must manually update firewall tunnel and policies.\n";
 	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	$host_fqdn = $wan0_host_fqdn;
+    }
+    else { # wan1
+	print "Distributing via v6 since v4 address doesn't have access.\n";
+	print "Warning: Must manually update DNS record via $dns.\n";
+	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
+	$host_fqdn = $wan1_host_fqdn;
+    }
+    if (defined ($host_fqdn)) {
+	$old_address = &_get_wan_ip ($host_fqdn);
+    }
+    else {
 	$old_address = 'null';
-	while ($old_address eq 'null') {
-    	  print "Old IP Address: ";
-    	  $old_address = <STDIN>;
-    	  chop ($old_address);
-	  $old_address = 'null' if ($old_address !~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
+    }
+    while (1) {
+	print "Old address: $old_address (return or enter correct): ";
+	my $input_string = <STDIN>;
+	chop ($input_string);
+	if ($input_string =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+	    $old_address = $input_string;
+	    last;
+	}
+	elsif ($input_string eq '') {
+	    $input_string = $old_address;
+	    last;
+	}
+	else {
+	    print "Invalid response \"$input_string\". Enter new IP or hit return.\n";
 	}
     }
     
@@ -994,6 +994,28 @@ sub _custom_get_old_and_new_ip_addresses {
     }
     
     return ($old_address, $new_address);
+}
+
+# Subroutine to get WAN IP from fqdn.
+sub _get_wan_ip {
+    my ($host_fqdn) = @_;
+    my ($old_address, $err, @res, $ai);
+
+    ($err, @res) = getaddrinfo ($host_fqdn, "", {socktype => SOCK_RAW});
+    if ($err) {
+	print "Cannot getaddrinfo - $err";
+	$old_address = 'null';
+	return ($old_address);
+    }
+    while ( $ai = shift @res ) {
+	($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+	if ($err) {
+	    print "Cannot getnameinfo - $err";
+	    $old_address = 'null';
+	    return ($old_address);
+	}
+    }
+    return ($old_address);
 }
 
 # Subroutine to do global string replacement on a given file.
