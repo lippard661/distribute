@@ -29,8 +29,12 @@
 # Modified 10 February 2025 by Jim Lippard to not use syslock if not present
 #    on system (in which case any signed grp files in the install dirs will
 #    be ignored as extraneous files).
-# Modified 30 July 2025 by Jim Lippard to allow options -f (to use syslock/sysunlock -f
-#    even if system is not in single-user mode) and -n (no syslock).
+# Modified 30 July 2025 by Jim Lippard to allow options -f (to use syslock/sysunlock
+#    even if system is not in single-user mode) and -n (no syslock). -f does not call
+#    sysunlock (or syslock) with -f but rather just makes the call on the assumption
+#    that the system is either using uchg flags or the group(s) in question are uchg
+#    groups. If false, error messages will be produced and it will abort, potentially
+#    with some unlocking having already occurred.
 
 use strict;
 use Archive::Tar;
@@ -125,6 +129,8 @@ getopts ('fn', %opts) || exit;
 $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
 
+die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag & !$use_syslock);
+
 if ($#ARGV != -1) {
     die "Usage: install.pl [-f (force)|-n (no syslock)]\n";
 }
@@ -134,9 +140,12 @@ $user = getpwuid($<);
 die "Error. Must be run by root.\n" if ($user ne 'root');
 
 # If no syslock, don't use syslock.
-$use_syslock = 0 if (!-e $SYSLOCK);
+if (!-e $SYSLOCK) {
+   $use_syslock = 0;
+   die "Cannot use -f because you don't have syslock.\n" if ($force_flag);
+}
 
-# Check securelevel if using syslock.
+# Check securelevel if using syslock (or -f force_flag is used).
 if ($use_syslock && !$force_flag) {
     $securelevel = `$SYSCTL kern.securelevel`;
     chop ($securelevel);
@@ -243,13 +252,10 @@ push (@changelog_entry, "$date-$user:");
 # Unlock system.
 if ($use_syslock) {
     foreach $syslock_group (@SYSLOCK_GROUPS) {
+	system ($SYSUNLOCK, '-g', $syslock_group);
 	if ($force_flag) {
-	    system ($SYSUNLOCK, '-f', '-g', $syslock_group);
 	    my $exit_code = $? >> 8;
 	    die "sysunlock failed with exit code: $exit_code\n" if ($exit_code != 0);
-	}
-	else {
-	    system ($SYSUNLOCK, '-g', $syslock_group);
 	}
     }
 }
@@ -301,12 +307,7 @@ foreach $file (@files) {
 if ($use_syslock) {
     # Re-lock system.
     foreach $syslock_group (@SYSLOCK_GROUPS) {
-	if ($force_flag) { # don't check error code as this should work if the unlock did
-	    system ($SYSLOCK, '-f', '-g', $syslock_group);
-	}
-	else {
-	    system ($SYSLOCK, '-g', $syslock_group);
-	}
+	system ($SYSLOCK, '-g', $syslock_group);
     }
 }
 
