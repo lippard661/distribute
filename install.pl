@@ -29,12 +29,15 @@
 # Modified 10 February 2025 by Jim Lippard to not use syslock if not present
 #    on system (in which case any signed grp files in the install dirs will
 #    be ignored as extraneous files).
+# Modified 30 July 2025 by Jim Lippard to allow options -f (to use syslock/sysunlock -f
+#    even if system is not in single-user mode) and -n (no syslock).
 
 use strict;
 use Archive::Tar;
 use Cwd;
 use File::Basename qw(fileparse);
 use File::Path qw(rmtree);
+use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
 use Signify;
@@ -98,7 +101,9 @@ my ($securelevel, $host, $domain, $syslock_group, @files, $file,
     $user, $date, @changelog_entry, @contents, $line,
     $installed_something, $temp_dir);
 my (@grp_files, @errors);
+my %opts;
 my $use_syslock = 1;
+my $force_flag = 0;
 
 ### Main program.
 
@@ -114,8 +119,14 @@ my $use_syslock = 1;
 # 9. Re-lock.
 # 10. Update CHANGELOG.
 
+# Check options.
+getopts ('fn', %opts) || exit;
+
+$force_flag = $opts{'f'};
+$use_syslock = 0 if ($opts{'n'});
+
 if ($#ARGV != -1) {
-    die "Usage: install.pl\n";
+    die "Usage: install.pl [-f (force)|-n (no syslock)]\n";
 }
 
 # Get user.
@@ -126,7 +137,7 @@ die "Error. Must be run by root.\n" if ($user ne 'root');
 $use_syslock = 0 if (!-e $SYSLOCK);
 
 # Check securelevel if using syslock.
-if ($use_syslock) {
+if ($use_syslock && !$force_flag) {
     $securelevel = `$SYSCTL kern.securelevel`;
     chop ($securelevel);
     if ($securelevel =~ /^.*=(\d+)$/) {
@@ -230,8 +241,17 @@ $date = strftime ("%Y-%m-%d", localtime (time()));
 push (@changelog_entry, "$date-$user:");
 
 # Unlock system.
-foreach $syslock_group (@SYSLOCK_GROUPS) {
-    system ($SYSUNLOCK, '-g', $syslock_group);
+if ($use_syslock) {
+    foreach $syslock_group (@SYSLOCK_GROUPS) {
+	if ($force_flag) {
+	    system ($SYSUNLOCK, '-f', '-g', $syslock_group);
+	    my $exit_code = $? >> 8;
+	    die "sysunlock failed with exit code: $exit_code\n" if ($exit_code != 0);
+	}
+	else {
+	    system ($SYSUNLOCK, '-g', $syslock_group);
+	}
+    }
 }
 
 # Create temp dir. Needed only for signature verification.
@@ -281,7 +301,12 @@ foreach $file (@files) {
 if ($use_syslock) {
     # Re-lock system.
     foreach $syslock_group (@SYSLOCK_GROUPS) {
-	system ($SYSLOCK, '-g', $syslock_group);
+	if ($force_flag) { # don't check error code as this should work if the unlock did
+	    system ($SYSLOCK, '-f', '-g', $syslock_group);
+	}
+	else {
+	    system ($SYSLOCK, '-g', $syslock_group);
+	}
     }
 }
 
