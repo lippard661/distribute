@@ -124,7 +124,7 @@ my $force_flag = 0;
 # 10. Update CHANGELOG.
 
 # Check options.
-getopts ('fn', %opts) || exit;
+getopts ('fn', \%opts) || exit;
 
 $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
