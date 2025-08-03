@@ -76,7 +76,8 @@
 #    ip-address if the DNS record is inaccurate, fix bug in DNS lookup.
 # Modified 22 June 2025 by Jim Lippard to allow each wan to have a separate
 #    DNS record.
-# Modified 2 August 2025 by Jim Lippard to do better version checks.
+# Modified 2 August 2025 by Jim Lippard to do better version checks (> is
+#    preferred to gt).
 
 use strict;
 use Archive::Tar;
@@ -682,9 +683,9 @@ sub parse_config {
 sub find_package {
     my ($pkg_dir, $pkg_start) = @_;
     my (@files, $file, $version, $pkg_path);
-    my ($major_version, $minor_version, $patch_version,
+    my ($major_version, $minor_version, $minor_alpha, $patch_version,
 	$check_version,
-	$check_major_version, $check_minor_version, $check_patch_version);
+	$check_major_version, $check_minor_version, $check_minor_alpha, $check_patch_version);
 
     if ($pkg_start =~ /^(.*)-PKG$/) {
 	$pkg_start = $1;
@@ -700,6 +701,7 @@ sub find_package {
     $version = '0.0.0';
     $major_version = '0';
     $minor_version = '0';
+    $minor_alpha = '';
     $patch_version = '0';
 
     foreach $file (@files) {
@@ -712,15 +714,24 @@ sub find_package {
 	    ($check_major_version, $check_minor_version, $check_patch_version) = split (/\./, $check_version);
 	    $check_minor_version = '0' if (!defined ($check_minor_version));
 	    $check_patch_version = '0' if (!defined ($check_patch_version));
-	    if ($check_major_version gt $major_version ||
+	    if ($check_minor_version =~ /^(\d+)([\w]+)$/) {
+		$check_minor_version = $1;
+		$check_minor_alpha = $2;
+	    }
+	    if ($check_major_version > $major_version ||
 		($check_major_version eq $major_version &&
-		 $check_minor_version gt $minor_version) ||
+		 $check_minor_version > $minor_version) ||
 		($check_major_version eq $major_version &&
 		 $check_minor_version eq $minor_version &&
-		 $check_patch_version gt $patch_version)) {
+		 $check_minor_alpha > $minor_alpha) ||
+		($check_major_version eq $major_version &&
+		 $check_minor_version eq $minor_version &&
+		 $check_minor_alpha eq $minor_alpha &&
+		 $check_patch_version > $patch_version)) {
 		$version = $check_version;
 		$major_version = $check_major_version;
 		$minor_version = $check_minor_version;
+		$minor_alpha = $check_minor_alpha;
 		$patch_version = $check_patch_version;
 	    }
 	}
