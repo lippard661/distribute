@@ -1,7 +1,7 @@
 distribute and install perl scripts to distribute files to multiple hosts and install them.
 
-Current version of distribute.pl from 3 August 2025.
-Current version of install.pl from 2 August 2025.
+Current version of distribute.pl from 6 August 2025.
+Current version of install.pl from 6 August 2025.
 
 Intended primarily for OpenBSD hosts that use immutable file systems.
 
