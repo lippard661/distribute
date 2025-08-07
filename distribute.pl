@@ -318,7 +318,7 @@ if ($^O eq 'openbsd') {
 }
 else {
     $temp_dir = `$MKTEMP -d -q /tmp/distribute.XXXXXXX`;
-    chop ($temp_dir);
+    chomp ($temp_dir);
 }
 
 foreach $file (@files) {
@@ -504,7 +504,7 @@ sub parse_config {
 
     open (FILE, '<', $config_file) || die "Cannot open config file $config_file. $!\n";
     while (<FILE>) {
-	chop;
+	chomp;
 	$line_no++;
 	if (/^\s*#|^\s*$/) {
 	    # ignore
@@ -750,7 +750,7 @@ sub get_signify_passphrase {
     print "signify passphrase: ";
     $signify_passphrase = <STDIN>;
     system ($STTY, 'echo');
-    chop ($signify_passphrase);
+    chomp ($signify_passphrase);
     return ($signify_passphrase);
 }
 
@@ -974,7 +974,7 @@ sub _custom_get_old_and_new_ip_addresses {
     while ($wan0_or_wan1 eq 'null') {
 	print "$wan0 or $wan1? ";
 	$wan0_or_wan1 = <STDIN>;
-	chop ($wan0_or_wan1);
+	chomp ($wan0_or_wan1);
 	$wan0_or_wan1 =~ tr/A-Z/a-z/;
 	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
     }
@@ -1003,7 +1003,7 @@ sub _custom_get_old_and_new_ip_addresses {
     while (1) {
 	print "Old address: $old_address (return or enter correct): ";
 	my $input_string = <STDIN>;
-	chop ($input_string);
+	chomp ($input_string);
 	if ($input_string =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
 	    $old_address = $input_string;
 	    last;
@@ -1021,7 +1021,7 @@ sub _custom_get_old_and_new_ip_addresses {
     while ($new_address eq 'null') {
     	  print "New IP Address: ";
     	  $new_address = <STDIN>;
-    	  chop ($new_address);
+    	  chomp ($new_address);
 	  $new_address = 'null' if ($new_address !~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
     }
     

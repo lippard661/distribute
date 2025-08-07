@@ -108,6 +108,7 @@ my (@grp_files, @errors);
 my %opts;
 my $use_syslock = 1;
 my $force_flag = 0;
+my $debug_flag = 0;
 
 ### Main program.
 
@@ -124,15 +125,16 @@ my $force_flag = 0;
 # 10. Update CHANGELOG.
 
 # Check options.
-getopts ('fn', \%opts) || exit;
+getopts ('fnd', \%opts) || exit;
 
 $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
+$debug_flag = $opts{'d'};
 
 die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag & !$use_syslock);
 
 if ($#ARGV != -1) {
-    die "Usage: install.pl [-f (force)|-n (no syslock)]\n";
+    die "Usage: install.pl [-f (force)|-n (no syslock)|-d debug]\n";
 }
 
 # Get user.
@@ -148,7 +150,7 @@ if (!-e $SYSLOCK) {
 # Check securelevel if using syslock (or -f force_flag is used).
 if ($use_syslock && !$force_flag) {
     $securelevel = `$SYSCTL kern.securelevel`;
-    chop ($securelevel);
+    chomp ($securelevel);
     if ($securelevel =~ /^.*=(\d+)$/) {
 	$securelevel = $1;
 	if ($securelevel != 0) {
@@ -158,6 +160,7 @@ if ($use_syslock && !$force_flag) {
     else {
 	die "Cannot get system securelevel. Output: $securelevel. $!\n";
     }
+    print "DEBUG: securelevel=$securelevel\n" if ($debug_flag);
 }
 
 # Use pledge. Unveil somewhat limited since installations are going
@@ -222,10 +225,11 @@ if ($use_syslock) {
 		Signify::verify ("$INSTALL_DIR/$file", $PRIOR_SIGNIFY_PUB_KEY)) {
 		open (FILE, '<', "$INSTALL_DIR/$file") || die "Cannot open syslock group file. $! $INSTALL_DIR/$file\n";
 		while (<FILE>) {
-		    chop;
+		    chomp;
 		    push (@SYSLOCK_GROUPS, $_) unless (grep /^$_$/, @SYSLOCK_GROUPS);
 		}
 		close (FILE);
+		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS" if ($debug_flag);
 	    }
 	    else {
 		@errors = Signify::signify_error;
@@ -252,6 +256,7 @@ push (@changelog_entry, "$date-$user:");
 # Unlock system.
 if ($use_syslock) {
     foreach $syslock_group (@SYSLOCK_GROUPS) {
+	print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
 	system ($SYSUNLOCK, '-g', $syslock_group);
 	if ($force_flag) {
 	    my $exit_code = $? >> 8;
@@ -307,6 +312,7 @@ foreach $file (@files) {
 if ($use_syslock) {
     # Re-lock system.
     foreach $syslock_group (@SYSLOCK_GROUPS) {
+	print "DEBUG: locking syslock group $syslock_group\n" if ($debug_flag);
 	system ($SYSLOCK, '-g', $syslock_group);
     }
 }
@@ -347,6 +353,7 @@ sub install_pkg_add {
 	return;
     }
 
+    print "DEBUG: installing package $file\n" if ($debug_flag);
     if (system ($PKG_ADD, $file)) {
 	return 0;
     }
@@ -372,6 +379,7 @@ sub verify_and_extract_package {
     $tar = Archive::Tar->new;
     $tar->read($file);
     $tar->setcwd ( cwd() );
+    print "DEBUG: extracting tar file $file\n" if ($debug_flag);
     @fileobjs = $tar->extract();
     
     # Indent each filename line with a tab, three spaces, and a leading slash.
