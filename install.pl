@@ -229,7 +229,7 @@ if ($use_syslock) {
 		    push (@SYSLOCK_GROUPS, $_) unless (grep /^$_$/, @SYSLOCK_GROUPS);
 		}
 		close (FILE);
-		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS" if ($debug_flag);
+		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
 	    }
 	    else {
 		@errors = Signify::signify_error;
