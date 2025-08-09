@@ -78,6 +78,7 @@
 #    DNS record.
 # Modified 2 August 2025 by Jim Lippard to do better version checks (> is
 #    preferred to gt).
+# Modified 8 August 2025 by Jim Lippard to add -h host option and -d debug option.
 
 use strict;
 use Archive::Tar;
@@ -159,7 +160,8 @@ my %CUSTOM_PLEDGE = ('ip-address' => [ 'dns', 'fattr' ] );
 
 ### Variables.
 
-my (%opts, $use_v6, $use_prev_year_key, $rsync_host_suffix, $config_file);
+my (%opts, $use_v6, $use_prev_year_key, $rsync_host_suffix, $config_file,
+    $host_option, @selected_hosts, $debug_flag);
 
 my ($arg, @args, $file, @files, $package_path,
     %host_package_path, %host_package_files,
@@ -212,7 +214,7 @@ my @errors;
 ### Main program.
 
 # Get options first.
-getopts ('46pc:', \%opts) || exit;
+getopts ('46pdc:h:', \%opts) || exit;
 
 # -4 default and doesn't really do anything.
 if ($opts{'4'} && $opts{'6'}) {
@@ -234,8 +236,25 @@ if ($opts{'p'}) {
 
 $config_file = $opts{'c'} || $CONFIG_FILE;
 
+# get selected hosts, validation comes after config parsing.
+if ($opts{'h'}) {
+    $host_option = 1;
+    $host = $opts{'h'};
+    if ($host =~ /,/) {
+	@selected_hosts = split (/,\s*/, $host);
+    }
+    else {
+	push (@selected_hosts, $host);
+    }
+}
+else {
+    $host_option = 0;
+}
+
+$debug_flag = $opts{'d'};
+
 if ($#ARGV == -1) {
-    die "Usage: distribute.pl [-4|-6|-p (prior year key)|-c config] [files]\n";
+    die "Usage: distribute.pl [-4|-6|-p (prior year key)|-c config|-h hosts(CSV)|-d debug] [files]\n";
 }
 
 # Parse config file.
@@ -248,6 +267,13 @@ foreach $arg (@ARGV) {
     push (@files, $arg);
     if ($CONFIG{$arg}{TYPE} eq 'custom') {
 	push (@custom_pledges, $CUSTOM_PLEDGE{$arg}) if ($CUSTOM_PLEDGE{$arg});
+    }
+}
+
+# Validate @selected_hosts;
+if ($opts{'h'}) {
+    foreach $host (@selected_hosts) {
+	die "-h $opts{'h'} specifies host not defined in config. $host\n" if (!grep(/^$host$/, @HOSTS));
     }
 }
 
@@ -322,11 +348,16 @@ else {
 }
 
 foreach $file (@files) {
+    print "DEBUG: processing file $file\n" if ($debug_flag);
     # Convert 'all' to the hosts list. Does not include hagbard.
     $CONFIG{$file}{HOSTS} = \@HOSTS if ($CONFIG{$file}{HOSTS}[0] eq 'all');
 
+    print "DEBUG: \@{\$CONFIG{\$file}{HOSTS}} = @{$CONFIG{$file}{HOSTS}}\n" if ($debug_flag);
+    print "DEBUG: \@selected_hosts = @selected_hosts\n" if ($debug_flag && $host_option);
     # Accumulate syslock groups.
     foreach $host (@{$CONFIG{$file}{HOSTS}}) {
+	next if ($host_option && !grep (/^$host$/, @selected_hosts));
+	print "DEBUG: processing host $host\n" if ($debug_flag);
 	(@{$syslock_groups{$host}}) = &add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
     }
 
