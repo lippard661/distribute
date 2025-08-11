@@ -258,6 +258,7 @@ if ($#ARGV == -1) {
 }
 
 # Parse config file.
+print "DEBUG: parsing config file $config_file\n" if ($debug_flag);
 &parse_config ($config_file);
 
 # Validate.
@@ -279,6 +280,7 @@ if ($opts{'h'}) {
 
 # Get the date (YYMMDD-HHMMSS).
 $date = strftime ("%Y%m%d-%H%M%s", localtime (time()));
+print "DEBUG: getting date: $date\n" if ($debug_flag);
 
 # Use pledge and unveil.
 # Already got the date so don't need /usr/share/zoneinfo.
@@ -286,7 +288,8 @@ if ($^O eq 'openbsd') {
     my ($dir);
     
     # pledge. stdio already included.
-    pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'exec', 'proc', 'fattr', 'unveil', @custom_pledges);
+    print "DEBUG: \@custom_pledges = @custom_pledges\n" if ($debug_flag);
+    pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'exec', 'proc', 'fattr', 'unveil', @custom_pledges) || die "Cannot pledge promises. $!\n";
 
     # unveil, need read-only for all source locations, read-write-create
     # for destination locations, and read-execute for all commands used.
@@ -364,6 +367,7 @@ foreach $file (@files) {
     if ($CONFIG{$file}{TYPE} eq 'package') {
 	# Look for most up-to-date package in $PKG_DIR.
 	$package_path = &find_package ($PKG_DIR, $CONFIG{$file}{FILE});
+	print "DEBUG: processing package $package_path\n" if ($debug_flag);
 	# Verify signature.
 	if (!&verify_signature ($package_path)) {
 	    die "Invalid or missing signature. $package_path\n";
@@ -385,6 +389,7 @@ foreach $file (@files) {
     elsif ($CONFIG{$file}{TYPE} eq 'plain') {
 	# Make sure file exists.
 	die "File in config can't be found. $! $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE});
+	print "DEBUG: processing plain file $file\n" if ($debug_flag);
 
 	# If the destination is different from the source (DEST is used),
 	# set up fake temp dir. (Need separate fake temp dir for each host
@@ -416,6 +421,7 @@ foreach $file (@files) {
 	# will have to do $HOST substitution and check all relevant
 	# instances.
 	die "File in config can't be found. $! $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE} && $CONFIG{$file}{FILE} !~ /,/);
+	print "DEBUG: processing custom file $file\n" if ($debug_flag);
 
 	# Each is separate, for now. There may end up being some different
 	# custom types that have common features.
@@ -449,6 +455,7 @@ if (%host_package_files) {
 # If there were any plain or custom files, create and sign the gzips, then copy
 # the packages to the install directory.
 foreach $host (keys (%host_package_files)) {
+    print "DEBUG: creating package for plain and custom for host $host\n" if ($debug_flag);
     $host_package_path{$host} = &create_package ($have_fake_dir, $temp_dir, $date, $host, @{$host_package_files{$host}});
     if (!$use_prev_year_key && !Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $SIGNIFY_SEC_KEY, $temp_dir)) {
 	my @errors = Signify::signify_error;
@@ -463,6 +470,8 @@ foreach $host (keys (%host_package_files)) {
 
     # Create syslock group file if any syslock groups are specified.
     if (@{$syslock_groups{$host}}) {
+	print "DEBUG: creating syslock group file for $host\n" if ($debug_flag);
+	print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
 	&create_syslock_group_file ("$host_package_path{$host}.grp", @{$syslock_groups{$host}});
 	# Sign it.
 	if (!$use_prev_year_key && !Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $SIGNIFY_SEC_KEY)) {
