@@ -163,7 +163,7 @@ my %CUSTOM_PLEDGE = ('ip-address' => [ 'dns', 'fattr' ] );
 my (%opts, $use_v6, $use_prev_year_key, $rsync_host_suffix, $config_file,
     $host_option, @selected_hosts, $debug_flag);
 
-my ($arg, @args, $file, @files, $package_path,
+my ($arg, @args, $file, @files, @process_hosts, $package_path,
     %host_package_path, %host_package_files,
     $host, $date, $temp_dir, $temp_file,
     $dest_path, $dest_dir, $dest_file,
@@ -357,9 +357,15 @@ foreach $file (@files) {
 
     print "DEBUG: \@{\$CONFIG{\$file}{HOSTS}} = @{$CONFIG{$file}{HOSTS}}\n" if ($debug_flag);
     print "DEBUG: \@selected_hosts = @selected_hosts\n" if ($debug_flag && $host_option);
-    # Accumulate syslock groups.
+
+    # Put relevant hosts in @process_hosts.
     foreach $host (@{$CONFIG{$file}{HOSTS}}) {
 	next if ($host_option && !grep (/^$host$/, @selected_hosts));
+	push (@process_hosts, $host);
+    }
+    
+    # Accumulate syslock groups.
+    foreach $host (@process_hosts){
 	print "DEBUG: processing host $host\n" if ($debug_flag);
 	(@{$syslock_groups{$host}}) = &add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
     }
@@ -375,14 +381,14 @@ foreach $file (@files) {
 	# Copy package to install directories.
 	# We put these into host_package_path so they get shipped, but
 	# not into host_package_files which get signed.
-	@install_packages = &copy_package ($package_path, @{$CONFIG{$file}{HOSTS}});
+	@install_packages = &copy_package ($package_path, @process_hosts);
 
 	push (@files_to_ship_and_remove, @install_packages);
 	# It's not dest_file or dest_dir in this case, it's just the
 	# package filename, so we can add it to host_package_path so
 	# that it gets shipped.
 	($dest_file, $dest_dir) = fileparse ($package_path);
-	foreach $host (@{$CONFIG{$file}{HOSTS}}) {
+	foreach $host (@process_hosts) {
 	    $host_package_path{$host} = "$INSTALL_DIR/$host/$dest_file";
 	}
     }
@@ -399,7 +405,7 @@ foreach $file (@files) {
 	    $dest_path = $CONFIG{$file}{DEST};
 	    ($dest_file, $dest_dir) = fileparse ($dest_path);
 	    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
-	    foreach $host (@{$CONFIG{$file}{HOSTS}}) {
+	    foreach $host (@process_hosts) {
 		# Make the fake directory (per-host).
 		&make_fake_dir ($temp_dir, $dest_dir, $host);
 		# Copy the file into it. Preserve permissions.
@@ -411,7 +417,7 @@ foreach $file (@files) {
 	    $dest_path = $CONFIG{$file}{FILE};
 	}
 	# Add to file to package list.
-	foreach $host (@{$CONFIG{$file}{HOSTS}}) {
+	foreach $host (@process_hosts) {
 	    push (@{$host_package_files{$host}}, $dest_path);
 	}
     }
@@ -426,7 +432,7 @@ foreach $file (@files) {
 	# Each is separate, for now. There may end up being some different
 	# custom types that have common features.
 	if ($file eq 'doas.conf') {
-	    &_custom_doas_dot_conf ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{DEST}, @{$CONFIG{$file}{HOSTS}});
+	    &_custom_doas_dot_conf ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{DEST}, @process_hosts);
 	    $have_fake_dir = 1;
 	}
 	# Change old IP address to new IP address in a list of files for
@@ -435,7 +441,7 @@ foreach $file (@files) {
 	# /etc, /etc/mail, /home/_rsyncu/.ssh
 	# This does not change /etc/faild.conf for hagbard.
 	elsif ($file eq 'ip-address') {
-	    &_custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @{$CONFIG{$file}{HOSTS}});
+	    &_custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
 	    $have_fake_dir = 1;
 	}
 	else {
