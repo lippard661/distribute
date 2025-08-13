@@ -79,8 +79,11 @@
 # Modified 2 August 2025 by Jim Lippard to do better version checks (> is
 #    preferred to gt).
 # Modified 8 August 2025 by Jim Lippard to add -h host option and -d debug option.
+# Modified 13 August 2025 by Jim Lippard to use version.pm for version
+#    comparisons.
 
 use strict;
+use version;
 use Archive::Tar;
 use File::Basename qw(basename dirname fileparse);
 use File::Copy qw(copy cp);
@@ -728,10 +731,7 @@ sub parse_config {
 # Subroutine to find a package.
 sub find_package {
     my ($pkg_dir, $pkg_start) = @_;
-    my (@files, $file, $version, $pkg_path);
-    my ($major_version, $minor_version, $minor_alpha, $patch_version,
-	$check_version,
-	$check_major_version, $check_minor_version, $check_minor_alpha, $check_patch_version);
+    my (@files, $file, $version, $check_version, $pkg_path);
 
     if ($pkg_start =~ /^(.*)-PKG$/) {
 	$pkg_start = $1;
@@ -744,12 +744,6 @@ sub find_package {
     @files = grep (!/^\.{1,2}$/, readdir (DIR));
     closedir (DIR);
 
-    $version = '0.0.0';
-    $major_version = '0';
-    $minor_version = '0';
-    $minor_alpha = '';
-    $patch_version = '0';
-
     foreach $file (@files) {
 	if ($file =~ /^$pkg_start-([0-9\w\.]+)\.tgz$/ || $file =~ /^$pkg_start-([0-9\w\.]+-no_[0-9\w]+)\.tgz$/) {
 	    # This currently matches python-tkinter-xxx and not just
@@ -757,28 +751,12 @@ sub find_package {
 	    # and periods, and exclude hyphens? i.e., ([0-9\w\.]+)
 	    # instead of (.*)?
 	    $check_version = $1;
-	    ($check_major_version, $check_minor_version, $check_patch_version) = split (/\./, $check_version);
-	    $check_minor_version = '0' if (!defined ($check_minor_version));
-	    $check_patch_version = '0' if (!defined ($check_patch_version));
-	    if ($check_minor_version =~ /^(\d+)([\w]+)$/) {
-		$check_minor_version = $1;
-		$check_minor_alpha = $2;
-	    }
-	    if ($check_major_version > $major_version ||
-		($check_major_version eq $major_version &&
-		 $check_minor_version > $minor_version) ||
-		($check_major_version eq $major_version &&
-		 $check_minor_version eq $minor_version &&
-		 $check_minor_alpha > $minor_alpha) ||
-		($check_major_version eq $major_version &&
-		 $check_minor_version eq $minor_version &&
-		 $check_minor_alpha eq $minor_alpha &&
-		 $check_patch_version > $patch_version)) {
+	    if (!defined ($version)) {
 		$version = $check_version;
-		$major_version = $check_major_version;
-		$minor_version = $check_minor_version;
-		$minor_alpha = $check_minor_alpha;
-		$patch_version = $check_patch_version;
+	    }
+	    elsif (version->parse ($check_version) >
+		   version->parse ($version)) {
+		$version = $check_version;
 	    }
 	}
     }
