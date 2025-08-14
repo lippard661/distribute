@@ -784,15 +784,18 @@ sub version_gt {
 }
 
 # Parses versions.
-# OpenBSD ports: 3.11.10p0, 9.20.8p0v3, 9.20.9v3
-# My own use: 1.10a
+# maj.min.pat(pN)(vN) (Many OpenBSD ports: 3.11.10p0, 9.20.8p0v3, 9.20.9v3)
+# maj.min(alpha)(pN) (reportnew, py3-packaging)
+# yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
+# maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
 # Doesn't support perl's vMAJOR.MINOR.PATcH
 sub version_parse {
     my ($version) = @_;
     my ($major, $minor, $patch, $portrevision, $vv);
 
     $portrevision = -1; # if not found
-    
+
+    # maj.min.pat(pN)(vN)
     if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)*(v\d+)*$/) {
 	$major = $1;
 	$minor = $2;
@@ -800,11 +803,34 @@ sub version_parse {
 	$portrevision = $4 if (defined ($4));
 	$vv = $5 if (defined ($5));
     }
-    elsif ($version =~ /^(\d+)\.(\d+)([a-z])*(p\d+)*$/) {
+    # maj.min(alpha)(pN) (reportnew, py3-packaging)
+    elsif ($version =~ /^(\d+)\.(\d+)([a-o])*(p\d+)*$/) {
 	$major = $1;
 	$minor = $2;
 	$vv = $3 if (defined ($3));
 	$portrevision = $4 if (defined ($4));
+    }
+    # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]*)(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$vv = $4 if (defined ($4)); # alpha
+	$portrevision = $5 if (defined ($5));
+	# alpha & vN - if really need both, should break out alpha?
+	if (defined ($6) && defined ($vv)) {
+	    die "Cannot parse version \"$version\". Match on both an alpha patch and vN.\n";
+	}
+	# vN
+	$vv = $6 if (defined ($6));
+    }
+    # maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
+    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$portrevision = $4 if (defined ($4));
+	$vv = $5 if (defined ($5));
     }
     else {
 	die "Cannot parse version \"$version\".\n";
