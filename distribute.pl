@@ -79,11 +79,10 @@
 # Modified 2 August 2025 by Jim Lippard to do better version checks (> is
 #    preferred to gt).
 # Modified 8 August 2025 by Jim Lippard to add -h host option and -d debug option.
-# Modified 13 August 2025 by Jim Lippard to use version.pm for version
-#    comparisons.
+# Modified 13 August 2025 by Jim Lippard to take another stab at version comparisons,
+#    for OpenBSD package version formats.
 
 use strict;
-use version;
 use Archive::Tar;
 use File::Basename qw(basename dirname fileparse);
 use File::Copy qw(copy cp);
@@ -751,11 +750,11 @@ sub find_package {
 	    # and periods, and exclude hyphens? i.e., ([0-9\w\.]+)
 	    # instead of (.*)?
 	    $check_version = $1;
+	    
 	    if (!defined ($version)) {
 		$version = $check_version;
 	    }
-	    elsif (version->parse ($check_version) >
-		   version->parse ($version)) {
+	    elsif (&version_gt ($check_version, $version)) {
 		$version = $check_version;
 	    }
 	}
@@ -764,6 +763,56 @@ sub find_package {
     $pkg_path = $PKG_DIR . '/' . $pkg_start . '-' . $version . '.tgz';
     return ($pkg_path);
 }
+
+# Returns 1 if $version1 > $version2.
+sub version_gt {
+    my ($version1, $version2) = @_;
+    
+    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = &version_parse ($version1);
+    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = &version_parse ($version2);
+
+    return 1 if ($v1_major > $v2_major);
+    return 0 if ($v1_major < $v2_major);
+    return 1 if ($v1_minor > $v2_minor);
+    return 0 if ($v1_minor < $v2_minor);
+    return 1 if ($v1_patch > $v2_patch);
+    return 0 if ($v2_patch < $v2_patch);
+    return 1 if ($v1_vv gt $v2_vv);
+    return 0 if ($v1_vv lt $v2_vv);
+    return 1 if ($v1_portrevision gt $v2_portrevision);
+    return 0;
+}
+
+# Parses versions.
+# OpenBSD ports: 3.11.10p0, 9.20.8p0v3, 9.20.9v3
+# My own use: 1.10a
+# Doesn't support perl's vMAJOR.MINOR.PATcH
+sub version_parse {
+    my ($version) = @_;
+    my ($major, $minor, $patch, $portrevision, $vv);
+
+    $portrevision = -1; # if not found
+    
+    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$portrevision = $4 if (defined ($4));
+	$vv = $5 if (defined ($5));
+    }
+    elsif ($version =~ /^(\d+)\.(\d+)([a-z])*(p\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$vv = $3 if (defined ($3));
+	$portrevision = $4 if (defined ($4));
+    }
+    else {
+	die "Cannot parse version \"$version\".\n";
+    }
+
+    return ($major, $minor, $patch, $portrevision, $vv);
+}
+
 
 # Subroutine to get signify passphrase.
 sub get_signify_passphrase {
