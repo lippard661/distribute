@@ -269,7 +269,7 @@ foreach $arg (@ARGV) {
     die "Error in config. Undefined TYPE \"$CONFIG{$arg}{TYPE}\".\n" if (!grep (/^$CONFIG{$arg}{TYPE}$/, @TYPES));
     push (@files, $arg);
     if ($CONFIG{$arg}{TYPE} eq 'custom') {
-	push (@custom_pledges, $CUSTOM_PLEDGE{$arg}) if ($CUSTOM_PLEDGE{$arg});
+	push (@custom_pledges, @{$CUSTOM_PLEDGE{$arg}}) if ($CUSTOM_PLEDGE{$arg});
     }
 }
 
