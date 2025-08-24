@@ -29,12 +29,16 @@
 # Modified 10 February 2025 by Jim Lippard to not use syslock if not present
 #    on system (in which case any signed grp files in the install dirs will
 #    be ignored as extraneous files).
-# Modified 30 July 2025 by Jim Lippard to allow options -f (to use syslock/sysunlock
-#    even if system is not in single-user mode) and -n (no syslock). -f does not call
-#    sysunlock (or syslock) with -f but rather just makes the call on the assumption
-#    that the system is either using uchg flags or the group(s) in question are uchg
-#    groups. If false, error messages will be produced and it will abort, potentially
-#    with some unlocking having already occurred.
+# Modified 30 July 2025 by Jim Lippard to allow options -f (to use
+#    syslock/sysunlock even if system is not in single-user mode) and -n
+#    (no syslock). -f does not call sysunlock (or syslock) with -f but
+#    rather just makes the call on the assumption that the system is either
+#    using uchg flags or the group(s) in question are uchg groups. If false,
+#    error messages will be produced and it will abort, potentially with
+#    some unlocking having already occurred.
+# Modified 24 August 2025 by Jim Lippard to finally fix bug in adding
+#    syslock groups caused by grep overriding the value of $_ from file
+#    input.
 
 use strict;
 use Archive::Tar;
@@ -226,7 +230,8 @@ if ($use_syslock) {
 		open (FILE, '<', "$INSTALL_DIR/$file") || die "Cannot open syslock group file. $! $INSTALL_DIR/$file\n";
 		while (<FILE>) {
 		    chomp;
-		    push (@SYSLOCK_GROUPS, $_) unless (grep /^$_$/, @SYSLOCK_GROUPS);
+		    my $group = $_; # grep overwrites $_ for its own ends
+		    push (@SYSLOCK_GROUPS, $group) unless (grep (/^$group$/, @SYSLOCK_GROUPS));
 		}
 		close (FILE);
 		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
