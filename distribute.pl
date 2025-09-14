@@ -81,6 +81,10 @@
 # Modified 8 August 2025 by Jim Lippard to add -h host option and -d debug option.
 # Modified 13 August 2025 by Jim Lippard to take another stab at version comparisons,
 #    for OpenBSD package version formats.
+# Modified 14 September 2025 by Jim Lippard to convert 'all' to hosts list
+#    during config parsing and to support 'all except' followed by a hosts
+#    list. First step towards supporting distribution to multiple operating
+#    systems, in the future might allow defining host groups.
 
 use strict;
 use Archive::Tar;
@@ -354,8 +358,10 @@ else {
 
 foreach $file (@files) {
     print "DEBUG: processing file $file\n" if ($debug_flag);
+    # Used to keep 'all' in the config and convert here, now done during
+    # config parsing in order to support 'all except'.
     # Convert 'all' to the hosts list. Does not include hagbard.
-    $CONFIG{$file}{HOSTS} = \@HOSTS if ($CONFIG{$file}{HOSTS}[0] eq 'all');
+#    $CONFIG{$file}{HOSTS} = \@HOSTS if ($CONFIG{$file}{HOSTS}[0] eq 'all');
 
     print "DEBUG: \@{\$CONFIG{\$file}{HOSTS}} = @{$CONFIG{$file}{HOSTS}}\n" if ($debug_flag);
     print "DEBUG: \@selected_hosts = @selected_hosts\n" if ($debug_flag && $host_option);
@@ -543,7 +549,7 @@ sub parse_config {
     
     my ($line_no, @host_list, @syslock_groups_list,
 	$field, $value, $current_name,
-	@syslock_groups, $group, @hosts, $host);
+	@syslock_groups, $group, @hosts, $host, @except_hosts);
     my ($got_file, $got_dest, $got_type, $got_syslock_groups, $got_hosts);
     my (%macros, $macro_name, $have_macros, $more_to_process);
 
@@ -604,10 +610,11 @@ sub parse_config {
 		}
 		if (defined ($current_name)) {
 		    # Did we get required fields for previous? Also need to check this at end of file for the last one.
-		    die "No \"file:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_file);
-		    die "No \"type:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_type);
-		    die "No \"syslock-groups:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_syslock_groups && $CONFIG{$current_name}{TYPE} ne 'package' && @syslock_groups_list); # optional for packages, or for everything if no syslock-groups-list defined.
-		    die "No \"hosts:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_hosts);
+		    die "No \"file:\" defined for \"name: $current_name\" before next \"name:\" on line $line_no. $_\n" if (!$got_file);
+		    die "No \"type:\" defined for \"name: $current_name\" before next \"name:\" on line $line_no. $_\n" if (!$got_type);
+		    # syslock-groups should always be optional.
+#		    die "No \"syslock-groups:\" defined for \"name: $current_name\" before next \"name:\" on line $line_no. $_\n" if (!$got_syslock_groups && $CONFIG{$current_name}{TYPE} ne 'package' && @syslock_groups_list); # optional for packages, or for everything if no syslock-groups-list defined.
+		    die "No \"hosts:\" defined for \"name: $current_name\" before next \"name:\" on line $line_no. $_\n" if (!$got_hosts);
 		    $got_file = 0;
 		    $got_dest = 0;
 		    $got_type = 0;
@@ -701,11 +708,28 @@ sub parse_config {
 		die "A \"hosts:\" field in global context on line $line_no. $_\n" if ($context == $GLOBAL_CONTEXT);
 		die "A \"hosts:\" field used with no \"host-list:\" defined on line $line_no. $_\n" unless (@host_list);
 		die "A second \"hosts:\" for $current_name on line $line_no. $_\n" if ($got_hosts);
-		@hosts = split (/,\s*/, $value);
-		foreach $host (@hosts) {
-		    next if $host eq 'all';
-		    next if grep (/^$host$/, @host_list);
-		    die "Unknown host \"$host\" in \"hosts:\" field on line $line_no. $_\n";
+		if ($value eq 'all') {
+		    @hosts = @host_list;
+		}
+		elsif ($value =~ /^all except (.*)$/) {
+		    $value = $1;
+		    @except_hosts = split (/,\s*/, $value);
+		    foreach $host (@except_hosts) {
+			next if grep (/^$host$/, @host_list);
+			die "Unknown host \"$host\" in \"hosts:\" field on line $line_no. $_\n";
+		    }
+		    @hosts = (); # empty array
+		    foreach $host (@host_list) {
+			next if grep (/^$host$/, @except_hosts);
+			push (@hosts, $host);
+		    }
+		}
+		else { # just a list of hosts
+		    @hosts = split (/,\s*/, $value);
+		    foreach $host (@hosts) {
+			next if grep (/^$host$/, @host_list);
+			die "Unknown host \"$host\" in \"hosts:\" field on line $line_no. $_\n";
+		    }
 		}
 		push (@{$CONFIG{$current_name}{HOSTS}}, @hosts);
 		$got_hosts = 1;
@@ -723,7 +747,8 @@ sub parse_config {
     # Did we get required fields for last "name:"? Same checks as at each subsequent "name:" above.
     die "No \"file:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_file);
     die "No \"type:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_type);
-    die "No \"syslock-groups:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_syslock_groups);
+    # syslock-groups should always be optional.
+#    die "No \"syslock-groups:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_syslock_groups);
     die "No \"hosts:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_hosts);
 }
 

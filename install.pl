@@ -39,17 +39,22 @@
 # Modified 24 August 2025 by Jim Lippard to finally fix bug in adding
 #    syslock groups caused by grep overriding the value of $_ from file
 #    input.
+# Modified 14 September 2025 by Jim Lippard to use OpenBSD MkTemp when
+#    running on OpenBSD, use "install" for prefix on temp dir instead of
+#    "distribute," add minimal pkg_add equivalent for non-OpenBSD systems
+#    for some packages.
 
 use strict;
 use Archive::Tar;
 use Cwd;
-use File::Basename qw(fileparse);
+use File::Basename qw(fileparse basename);
 use File::Path qw(rmtree);
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
 use Signify;
 use Sys::Hostname;
+use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
@@ -183,7 +188,7 @@ if ($^O eq 'openbsd') {
     }
     
     # Unveil commands used.
-    unveil ($MKTEMP, 'rx');
+    # removed $MKTEMP.
     unveil ($PKG_ADD, 'rx');
     unveil ($PWD, 'rx'); # not sure what calls this
     unveil ($SIGNIFY, 'rx');
@@ -271,8 +276,13 @@ if ($use_syslock) {
 }
 
 # Create temp dir. Needed only for signature verification.
-$temp_dir = `$MKTEMP -d -q /tmp/distribute.XXXXXXX`;
-chop ($temp_dir);
+if ($^O eq 'openbsd') {
+    $temp_dir = mkdtemp ('/tmp/install.XXXXXXX');
+}
+else {
+    $temp_dir = `$MKTEMP -d -q /tmp/install.XXXXXXX`;
+    chomp ($temp_dir);
+}
 
 # For each file in the install dir:
 # If it is of the form <host>-<date>-<time>-package.tgz:
@@ -358,13 +368,115 @@ sub install_pkg_add {
 	return;
     }
 
+    if ($^O ne 'openbsd' && !-e $PKG_ADD) {
+	print "DEBUG: installing package $file with builtin minimal pkg_add.\n" if ($debug_flag);
+	return 1 if (&minimal_pkg_add ($file)); # success
+	return 0; # failure
+    }
+
     print "DEBUG: installing package $file\n" if ($debug_flag);
     if (system ($PKG_ADD, $file)) {
-	return 0;
+	return 0; # failure (system returns nonzero for failure)
     }
     else {
+	return 1; # success (system returns 0 for success)
+    }
+}
+
+# Builtin minimal pkg_add, called after signature already verified.
+# We verify signature after the tar file has been read to mitigate
+# TOCTOU race and potential malicious archive substitution.
+#   Look for +CONTENTS
+#      See if it's for @arch *
+#      Identify files to extract and dirs to create.
+#      Create necessary dirs.
+#      Extract files (including symlinks) into /usr/local
+# Return 1 for success, 0 for failure.
+sub minimal_pkg_add {
+    my ($file) = @_;
+    my ($tar, $file_minus_tgz, $content, @lines, $line,
+	@files_to_extract, @dirs_to_create, $dir);
+
+    # Read package as Tar file.
+    $tar = Archive::Tar->new;
+    if (!$tar->read($file)) {
+	print "Couldn't read tar file $file. $!\n";
+	return 0;
+    }
+    
+    # Do another signify verification post-tar-read to mitigate TOCTOU race.
+    if (!&verify_signature ($file)) {
+	print "Invalid or missing signature. Could not install package $file.\n";
+	return;
+    }
+
+    $file_minus_tgz = basename ($file);
+    $file_minus_tgz =~ s/\.tgz$//;
+
+    # Get content of +CONTENTS file and validate.
+    if ($content = $tar->get_content ('+CONTENTS')) {
+	# Verify that it's got a PLIST comment and has a matching @name.
+	if ($content !~ /^\@comment .OpenBSD: PLIST/m) {
+	    print "No \"\@comment\" PLIST found in +CONTENTS file for $file.\n";
+	    return 0;
+	}
+	if ($content !~ /^\@name $file_minus_tgz/m) {
+	    print "No \"\@name $file_minus_tgz\" found in +CONTENTS file for $file.\n";
+	    return 0;
+	}
+
+	# Verify it's for all architectures (e.g., perl script).
+	if ($content !~ /^\@arch \*$/m) {
+	    print "No \"\@arch *\" found in +CONTENTS file for $file.\n";
+	    return 0;
+	}
+
+	# Verify it's intended for /usr/local.
+	if ($content !~ /^\@cwd \/usr\/local$/m) {
+	    print "No \"\@cwd /usr/local\" found in +CONTENTS file for $file.\n";
+	    return 0;
+	}
+    }
+    else {
+	print "No +CONTENTS file found in $file.\n";
+	return 0;
+    }
+
+    # Let's look for files and attempt some extraction.
+    @lines = split (/\n/, $content);
+
+    foreach $line (@lines) {
+	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
+	    if ($line =~ /\/$/) { # lines ending in / are dirs
+		push (@dirs_to_create, $line);
+	    }
+	    else { # otherwise it's a file
+		push (@files_to_extract, $line);
+	    }
+	}
+    }
+
+    # Set directory, packages extract to /usr/local.
+    chdir ('/usr/local');
+    $tar->setcwd ( cwd() );
+
+    print "DEBUG: creating any required directories\n" if ($debug_flag);
+    foreach $dir (@dirs_to_create) {
+	if (!mkdir ('-p', $dir)) {
+	    print "Couldn't create required directory. $! /usr/local/$dir\n";
+	    return 0;
+	}
+	elsif ($debug_flag) {
+	    print "DEBUG: created dir $dir (and any missing intermediates)\n";
+	}
+    }
+
+    print "DEBUG: extracting package from tar file $file\n" if ($debug_flag);
+    if ($tar->extract(@files_to_extract)) {
 	return 1;
     }
+    print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
+    return 0;
 }
 
 # Extract contents of a signed package and return the contents list.
@@ -382,7 +494,10 @@ sub verify_and_extract_package {
     #    system ($TAR, 'xfz', $file, '-C', '/');
     chdir ('/');
     $tar = Archive::Tar->new;
-    $tar->read($file);
+    if (!$tar->read($file)) {
+	print "Couldn't read tar file $file. $!\n";
+	return;
+    }
     $tar->setcwd ( cwd() );
     print "DEBUG: extracting tar file $file\n" if ($debug_flag);
     @fileobjs = $tar->extract();
