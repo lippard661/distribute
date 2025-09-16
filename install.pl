@@ -43,12 +43,13 @@
 #    running on OpenBSD, use "install" for prefix on temp dir instead of
 #    "distribute," add minimal pkg_add equivalent for non-OpenBSD systems
 #    for some packages.
+# Modified 15 September 2025 to correct creation of directory paths.
 
 use strict;
 use Archive::Tar;
 use Cwd;
 use File::Basename qw(fileparse basename);
-use File::Path qw(rmtree);
+use File::Path qw(rmtree make_path);
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
@@ -396,6 +397,7 @@ sub minimal_pkg_add {
     my ($file) = @_;
     my ($tar, $file_minus_tgz, $content, @lines, $line,
 	@files_to_extract, @dirs_to_create, $dir);
+    my $DIR_PREFIX = '/usr/local';
 
     # Read package as Tar file.
     $tar = Archive::Tar->new;
@@ -432,8 +434,8 @@ sub minimal_pkg_add {
 	}
 
 	# Verify it's intended for /usr/local.
-	if ($content !~ /^\@cwd \/usr\/local$/m) {
-	    print "No \"\@cwd /usr/local\" found in +CONTENTS file for $file.\n";
+	if ($content !~ /^\@cwd $DIR_PREFIX$/m) {
+	    print "No \"\@cwd $DIR_PREFIX\" found in +CONTENTS file for $file.\n";
 	    return 0;
 	}
     }
@@ -448,7 +450,7 @@ sub minimal_pkg_add {
     foreach $line (@lines) {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
 	    if ($line =~ /\/$/) { # lines ending in / are dirs
-		push (@dirs_to_create, $line);
+		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
 	    }
 	    else { # otherwise it's a file
 		push (@files_to_extract, $line);
@@ -457,13 +459,13 @@ sub minimal_pkg_add {
     }
 
     # Set directory, packages extract to /usr/local.
-    chdir ('/usr/local');
+    chdir ($DIR_PREFIX);
     $tar->setcwd ( cwd() );
 
     print "DEBUG: creating any required directories\n" if ($debug_flag);
     foreach $dir (@dirs_to_create) {
-	if (!mkdir ('-p', $dir)) {
-	    print "Couldn't create required directory. $! /usr/local/$dir\n";
+	if (!make_path ("$DIR_PREFIX/$dir")) {
+	    print "Couldn't create required directory. $! $DIR_PREFIX/$dir\n";
 	    return 0;
 	}
 	elsif ($debug_flag) {
