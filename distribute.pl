@@ -85,7 +85,8 @@
 #    during config parsing and to support 'all except' followed by a hosts
 #    list. First step towards supporting distribution to multiple operating
 #    systems, in the future might allow defining host groups.
-# Modified 22 September 2025 by Jim Lippard to clean up some regexes.
+# Modified 22 September 2025 by Jim Lippard to clean up some regexes and fix bug in
+#    processing multiple files.
 
 use strict;
 use Archive::Tar;
@@ -358,6 +359,7 @@ else {
 }
 
 foreach $file (@files) {
+    @process_hosts = ();
     print "DEBUG: processing file $file\n" if ($debug_flag);
     # Used to keep 'all' in the config and convert here, now done during
     # config parsing in order to support 'all except'.
@@ -375,7 +377,7 @@ foreach $file (@files) {
     
     # Accumulate syslock groups.
     foreach $host (@process_hosts){
-	print "DEBUG: processing host $host\n" if ($debug_flag);
+	print "DEBUG: processing syslock groups for host $host\n" if ($debug_flag);
 	(@{$syslock_groups{$host}}) = &add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
     }
 
@@ -426,7 +428,9 @@ foreach $file (@files) {
 	    $dest_path = $CONFIG{$file}{FILE};
 	}
 	# Add to file to package list.
+	print "DEBUG: \@process_hosts = @process_hosts\n" if ($debug_flag);
 	foreach $host (@process_hosts) {
+	    print "DEBUG: adding $dest_path to package list for host $host\n" if ($debug_flag);
 	    push (@{$host_package_files{$host}}, $dest_path);
 	}
     }
