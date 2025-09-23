@@ -43,7 +43,8 @@
 #    running on OpenBSD, use "install" for prefix on temp dir instead of
 #    "distribute," add minimal pkg_add equivalent for non-OpenBSD systems
 #    for some packages.
-# Modified 15 September 2025 to correct creation of directory paths.
+# Modified 15 September 2025 by Jim Lippard to correct creation of directory paths.
+# Modified 22 September 2025 by Jim Lippard to clean up some regexes.
 
 use strict;
 use Archive::Tar;
@@ -305,7 +306,7 @@ foreach $file (@files) {
 	    $installed_something = 1;
 	}
     }
-    elsif ($file =~ /^([\w\d-]+-[\d\.\w]+)\.tgz$/ || $file =~ /^([\w\d-]+-[\d\.\w]+-no_[0-9\w]+)\.tgz$/) {
+    elsif ($file =~ /^([\w\-]+-[\.\w]+)\.tgz$/ || $file =~ /^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/) {
 	if (-d "$1") {
 	    print "Package $file already installed per existence of directory /var/db/pkg/$1.\n";
 	    unlink ("$INSTALL_DIR/$file");

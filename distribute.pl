@@ -85,6 +85,7 @@
 #    during config parsing and to support 'all except' followed by a hosts
 #    list. First step towards supporting distribution to multiple operating
 #    systems, in the future might allow defining host groups.
+# Modified 22 September 2025 by Jim Lippard to clean up some regexes.
 
 use strict;
 use Archive::Tar;
@@ -564,21 +565,21 @@ sub parse_config {
 	    # ignore
 	}
 	# Macro definition. Can occur anywhere so long as definition is before use.
-	elsif (/^([\w0-9-_]+)\s*=\s*\"([\S ]+)\"$/) {
+	elsif (/^([\w\-]+)\s*=\s*\"([\S ]+)\"$/) {
 	    $field = $1;
 	    $value = $2;
 	    die "Macro \"$field\" defined a second time on line $line_no. $_\n" if (defined ($macros{$field}));
 	    $macros{$field} = $value;
 	    $have_macros = 1;
 	}
-	elsif (/\s*([\w-]+):\s*(.*)$/) {
+	elsif (/\s*([\w\-]+):\s*(.*)$/) {
 	    $field = $1;
 	    $value = $2;
 
 	    # any macros to expand?
 	    $more_to_process = 1;
 	    while ($have_macros && $more_to_process) {
-		if ($value =~ /%%([\w0-9-_]+)%%/) {
+		if ($value =~ /%%([\w\-]+)%%/) {
 		    $macro_name = $1;
 		    if (defined ($macros{$macro_name})) {
 			$value =~ s/%%$macro_name%%/$macros{$macro_name}/g;
@@ -696,7 +697,7 @@ sub parse_config {
 		my @custom_vars = split (/,\s*/, $value);
 		my $custom_var;
 		foreach $custom_var (@custom_vars) {
-		    if ($custom_var =~ /\s*([\w0-1-_]+)\s*=\s*([\S ]+)$/) {
+		    if ($custom_var =~ /\s*([\w\-]+)\s*=\s*([\S ]+)$/) {
 			${$CONFIG{$current_name}{CUSTOMVARS}}{$1} = $2;
 		    }
 		    else {
@@ -769,10 +770,10 @@ sub find_package {
     closedir (DIR);
 
     foreach $file (@files) {
-	if ($file =~ /^$pkg_start-([0-9\w\.]+)\.tgz$/ || $file =~ /^$pkg_start-([0-9\w\.]+-no_[0-9\w]+)\.tgz$/) {
+	if ($file =~ /^$pkg_start-([\w\.]+)\.tgz$/ || $file =~ /^$pkg_start-([\w\.]+-no_[\w]+)\.tgz$/) {
 	    # This currently matches python-tkinter-xxx and not just
 	    # python-xxx. Is it safe to restrict $1 to numbers, letters,
-	    # and periods, and exclude hyphens? i.e., ([0-9\w\.]+)
+	    # and periods, and exclude hyphens? i.e., ([\w\.]+)
 	    # instead of (.*)?
 	    $check_version = $1;
 	    
