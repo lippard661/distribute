@@ -45,6 +45,7 @@
 #    for some packages.
 # Modified 15 September 2025 by Jim Lippard to correct creation of directory paths.
 # Modified 22 September 2025 by Jim Lippard to clean up some regexes.
+# Modified 24 September 2025 by Jim Lippard to produce some output for success.
 
 use strict;
 use Archive::Tar;
@@ -476,6 +477,7 @@ sub minimal_pkg_add {
 
     print "DEBUG: extracting package from tar file $file\n" if ($debug_flag);
     if ($tar->extract(@files_to_extract)) {
+	print "Installed package $file.\n";
 	return 1;
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);

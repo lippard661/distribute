@@ -87,6 +87,7 @@
 #    systems, in the future might allow defining host groups.
 # Modified 22 September 2025 by Jim Lippard to clean up some regexes and fix bug in
 #    processing multiple files.
+# Modified 24 September 2025 by Jim Lippard to complain if -h leads to no matches.
 
 use strict;
 use Archive::Tar;
@@ -374,6 +375,9 @@ foreach $file (@files) {
 	next if ($host_option && !grep (/^$host$/, @selected_hosts));
 	push (@process_hosts, $host);
     }
+
+    # Complain/die if -h selected no hosts.
+    die "No selected hosts match for file $file. @selected_hosts\n" if ($host_option && @process_hosts == 0);
     
     # Accumulate syslock groups.
     foreach $host (@process_hosts){
