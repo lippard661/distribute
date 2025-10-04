@@ -544,7 +544,7 @@ sub minimal_pkg_add {
 		$tar->extract ($sample_source_file, $samples_to_extract{$sample_file});
 	    }
 	    else {
-		print "DEBUG: not extractingsample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
+		print "DEBUG: not extracting sample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
 	    }
 	}
 	
