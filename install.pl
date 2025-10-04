@@ -46,11 +46,14 @@
 # Modified 15 September 2025 by Jim Lippard to correct creation of directory paths.
 # Modified 22 September 2025 by Jim Lippard to clean up some regexes.
 # Modified 24 September 2025 by Jim Lippard to produce some output for success.
+# Modified 2 October 2025 by Jim Lippard to correct check for already-installed
+#    package and to make the minimal pkg_add equivalent create /var/db/pkg
+#    registrations.
 
 use strict;
 use Archive::Tar;
 use Cwd;
-use File::Basename qw(fileparse basename);
+use File::Basename qw(fileparse basename dirname);
 use File::Path qw(rmtree make_path);
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
@@ -60,6 +63,11 @@ use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
+
+if ($^O eq 'darwin' || $^O eq 'linux') {
+    # hexdigest used for minimal_pkg_delete.
+    require Digest::SHA;
+}
 
 ### Constants.
 
@@ -159,8 +167,8 @@ if (!-e $SYSLOCK) {
    die "Cannot use -f because you don't have syslock.\n" if ($force_flag);
 }
 
-# Check securelevel if using syslock (or -f force_flag is used).
-if ($use_syslock && !$force_flag) {
+# Check securelevel if using syslock (and -f force_flag is not used).
+if ($use_syslock && !$force_flag && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
     $securelevel = `$SYSCTL kern.securelevel`;
     chomp ($securelevel);
     if ($securelevel =~ /^.*=(\d+)$/) {
@@ -308,7 +316,7 @@ foreach $file (@files) {
 	}
     }
     elsif ($file =~ /^([\w\-]+-[\.\w]+)\.tgz$/ || $file =~ /^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/) {
-	if (-d "$1") {
+	if (-d "/var/db/pkg/$1") {
 	    print "Package $file already installed per existence of directory /var/db/pkg/$1.\n";
 	    unlink ("$INSTALL_DIR/$file");
 	}
@@ -398,7 +406,9 @@ sub install_pkg_add {
 sub minimal_pkg_add {
     my ($file) = @_;
     my ($tar, $file_minus_tgz, $content, @lines, $line,
-	@files_to_extract, @dirs_to_create, $dir);
+	@files_to_extract, @dirs_to_create,
+	$sample_file, $sample_source_file, %samples_to_extract,
+	$dir, $older_package);
     my $DIR_PREFIX = '/usr/local';
 
     # Read package as Tar file.
@@ -446,6 +456,27 @@ sub minimal_pkg_add {
 	return 0;
     }
 
+    # Is a prior version of this package already installed? If so, remove it,
+    # but don't touch @sample dirs and files unless the files are unchanged
+    # since install.
+    # (1) If older version of package is installed (check, need to use subrs
+    #     from distribute.pl).)
+    # (2) Read its +CONTENTS (should be subroutine that can also be used above?)
+    # (3) Process in reverse (files to remove, directories to remove if empty,
+    #     files to remove if unchanged, checking for custom installed configs
+    #     for macOS/linux.
+    if ($older_package = &older_package_installed ($file)) {
+	if ($older_package =~ /^newer:(.*)$/) {
+	    print "Newer package $1 already installed.\n";
+	    return 0;
+	}
+	print "DEBUG: deleting package $older_package with builtin minimal pkg_delete.\n" if ($debug_flag);
+	if (!&minimal_pkg_delete ($older_package)) {
+	    print "Package delete of $older_package failed. Not installing $file.\n";
+	    return 0;
+	}
+    }
+
     # Let's look for files and attempt some extraction.
     @lines = split (/\n/, $content);
 
@@ -456,6 +487,19 @@ sub minimal_pkg_add {
 	    }
 	    else { # otherwise it's a file
 		push (@files_to_extract, $line);
+	    }
+	}
+	elsif ($line =~ /^\@sample (.*)$/) {
+	    $sample_file = $1;
+	    # Trailing / is a dir to create, most likely in /etc.
+	    if ($sample_file =~ /\/$/) {
+		push (@dirs_to_create, $sample_file) unless (-e $sample_file);
+	    }
+	    # A file to extract into another location if not already present.
+	    # Will typically be last file from @files_to_extract. Key is
+	    # file in tar file, value is full path of destination.
+	    else {
+		$samples_to_extract{$files_to_extract[-1]} = $sample_file;
 	    }
 	}
     }
@@ -478,10 +522,244 @@ sub minimal_pkg_add {
     print "DEBUG: extracting package from tar file $file\n" if ($debug_flag);
     if ($tar->extract(@files_to_extract)) {
 	print "Installed package $file.\n";
+	# Extract any sample files.
+	print "DEBUG: extracting sample files\n" if ($debug_flag);
+	foreach $sample_file (keys (%samples_to_extract)) {
+	    if (!-e $samples_to_extract{$sample_file}) {
+		$sample_source_file = $sample_file;
+		
+		# Look for custom config if on macOS or Linux.
+		if ($^O eq 'darwin' || $^O eq 'linux') {
+		    my ($sample_dir, $sample_base, $sample_prefix,
+			$sample_check);
+		    $sample_dir = dirname ($sample_source_file);
+		    $sample_base = basename ($sample_source_file);
+		    $sample_prefix = 'macos' if ($^O eq 'darwin');
+		    $sample_prefix = 'linux' if ($^O eq 'linux');
+		    $sample_check = $sample_dir . '/' . $sample_prefix . '.' . $sample_base;
+		    $sample_source_file = $sample_check if (grep /^$sample_check$/, @files_to_extract);
+		}
+		
+		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
+		$tar->extract ($sample_source_file, $samples_to_extract{$sample_file});
+	    }
+	    else {
+		print "DEBUG: not extractingsample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
+	    }
+	}
+	
+	# Register the installation.
+	print "DEBUG: creating /var/db/pkg registration\n" if ($debug_flag);
+	if (!make_path ("/var/db/pkg/$file_minus_tgz")) {
+	    print "Couldn't create /var/db/pkg/$file_minus_tgz. $!\n";
+	    return 1; # actual installation worked
+	}
+	# register package, ignoring errors
+	$tar->extract_file('+CONTENTS', "/var/db/pkg/$file_minus_tgz/+CONTENTS");
+	$tar->extract_file('+DESC', "/var/db/pkg/$file_minus_tgz/+DESC");
 	return 1;
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
     return 0;
+}
+
+# Is an older version of a package installed?
+sub older_package_installed {
+    my ($file) = @_;
+    my ($file_minus_tgz, $file_base, @files, $file_minus_version,
+	$current_version, $no_suffix,
+	$check_file, $check_version, $check_no_suffix);
+
+    # Remove .tgz.
+    $file_minus_tgz = $file;
+    $file_minus_tgz =~ s/\.tgz$//;
+
+    # Look at file basename (ignore dir).
+    $file_base = basename ($file_minus_tgz);
+    if ($file_base =~ /^(.*?)-(\d.*)$/) {
+	$file_minus_version = $1;
+	$current_version = $2;
+	if ($current_version =~ /(-no_\w+)$/) {
+	    $no_suffix = $1;
+	    $current_version =~ s/-no_\w+$//;
+	}
+    }
+    else {
+	print "Couldn't parse version from $file_base.\n";
+	return 0;
+    }
+
+    if (opendir (DIR, '/var/db/pkg')) {
+	@files = grep (!/^\.{1,2}$/, readdir (DIR));
+	closedir (DIR);
+    }
+    else {
+	print "Cannot open dir /var/db/pkg. $!\n";
+	return 0;
+    }
+
+    foreach $check_file (@files) {
+	# Might have an older version here.
+	if ($check_file =~ /^$file_minus_version-(\d.*)$/) {
+	    $check_version = $1;
+	    if ($check_version =~ /^(.*)-(no_\w+)$/) {
+		$check_no_suffix = $1;
+		$check_version =~ s/-no_\w+$//;
+		print "DEBUG: New package has $no_suffix, but current package has $check_no_suffix.\n" if ($no_suffix ne $check_no_suffix && $debug_flag);
+		return 0;
+	    }
+	    elsif ($no_suffix) {
+		print "DEBUG: New package has $no_suffix, but current package does not.\n" if ($debug_flag);
+		return 0;
+	    }
+	    if (&version_gt ($current_version, $check_version)) {
+		return ($check_file);
+	    }
+	    elsif (&version_gt ($check_version, $current_version)) {
+		return ("newer:$check_file"); # newer version installed
+	    }
+	}
+    }
+
+    print "DEBUG: No older package found.\n" if ($debug_flag);
+    return 0;
+}
+
+# Delete a package.
+sub minimal_pkg_delete {
+    my ($file) = @_;
+    my (@lines, $line, @dirs_to_delete, $dir_to_delete,
+	@files_to_delete, $file_to_delete,
+	$sample_file, $sample_source_file,
+	%samples_to_delete, %sample_size, %sample_sha, %sample_ts,
+	$ctx, $check_sha);
+    my $DIR_PREFIX = '/usr/local';
+
+    # Read +CONTENTS, looking for dirs and files to delete and sample files
+    # to potentially delete.
+    open (FILE, '<', "/var/db/pkg/$file/+CONTENTS");
+    while (<FILE>) {
+	chomp;
+	if (!/^[\@\+]/) { # lines not beginning with @ or +
+	    if (/\/$/) { # lines ending in / are dirs
+		push (@dirs_to_delete, "$DIR_PREFIX/$_");
+	    }
+	    else { # otherwise it's a file
+		push (@files_to_delete, "$DIR_PREFIX/$_");
+	    }
+	}
+	# @sample is already a full path.
+	elsif (/^\@sample (.*)$/) {
+	    $sample_file = $1;
+	    # Trailing / is a dir to delete, most likely in /etc.
+	    if ($sample_file =~ /\/$/) {
+		push (@dirs_to_delete, $sample_file) unless (!-e $sample_file);
+	    }
+	    # A file to extract into another location if not already present.
+	    # Will typically be last file from @files_to_extract. Key is
+	    # file in tar file, value is full path of destination.
+	    else {
+		$samples_to_delete{$files_to_delete[-1]} = $sample_file;
+	    }
+	}
+	# don't delete samples that have changed size/sha/ts.
+	# don't delete non-empty dirs.
+	elsif (/^\@size (\d+)$/) {
+	    $sample_size{$files_to_delete[-1]} = $1;
+	}
+	elsif (/^\@sha (.*)$/) {
+	    $sample_sha{$files_to_delete[-1]} = $1;
+	}
+	elsif (/^\@ts (.*)$/) {
+	    $sample_ts{$files_to_delete[-1]} = $1;
+	}
+	elsif (/^\@cwd (.*)$/) {
+	    if ($1 ne $DIR_PREFIX) {
+		print "+CONTENTS has \"\@cwd $1\", not /usr/local. Not removing package.\n";
+		return 0;
+	    }
+	}
+    }
+    close (FILE);
+
+    # Look for installed sample configs.
+    foreach $sample_file (keys (%samples_to_delete)) {
+	if (-e $samples_to_delete{$sample_file}) {
+	    $sample_source_file = $sample_file;
+
+	    # Look for custom config if on macOS or Linux.
+	    if ($^O eq 'darwin' || $^O eq 'linux') {
+		my ($sample_dir, $sample_base, $sample_prefix,
+		    $sample_check);
+		$sample_dir = dirname ($sample_source_file);
+		$sample_base = basename ($sample_source_file);
+		$sample_prefix = 'macos' if ($^O eq 'darwin');
+		$sample_prefix = 'linux' if ($^O eq 'linux');
+		$sample_check = $sample_dir . '/' . $sample_prefix . '.' . $sample_base;
+		$sample_source_file = $sample_check if (grep /^$sample_check$/, @files_to_delete);
+	    }
+
+	    # check that it's unchanged against size/sha/ts of $sample_source_file
+	    if (-s $samples_to_delete{$sample_file} == $sample_size{$sample_source_file}) {
+		print "DEBUG: size of $samples_to_delete{$sample_file} unchanged from $sample_source_file.\n" if ($debug_flag);
+		if (open (FILE, '<', $samples_to_delete{$sample_file})) {
+		    $ctx = Digest::SHA->new(256);
+		    $ctx->addfile (*FILE);
+		    close (FILE);
+		    $check_sha = $ctx->sha256_base64;
+		    while (length($check_sha) % 4) { # manually add padding
+			$check_sha .= '=';
+		    }
+		    if ($check_sha eq $sample_sha{$sample_source_file}) {
+			print "DEBUG: removing unchanged sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
+			unlink ($samples_to_delete{$sample_file});
+		    }
+		    elsif ($debug_flag) {
+			print "DEBUG: not removing changed (SHA256) sample file $samples_to_delete{$sample_file}.\n";
+			print "DEBUG: current: $check_sha, original: $sample_sha{$sample_source_file}.\n";
+		    }
+		}
+		else {
+		    print "DEBUG: could not open file $samples_to_delete{$sample_file} to check SHA256. $!\n" if ($debug_flag);
+		}
+	    }
+	    else {
+		print "DEBUG: not removing changed (size) sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
+	    }
+	}
+    }
+
+    # delete files.
+    foreach $file_to_delete (@files_to_delete) {
+	print "DEBUG: removing $file_to_delete.\n" if ($debug_flag);
+	if (!unlink ($file_to_delete)) {
+	    print "DEBUG: could not remove $file_to_delete. $!\n" if ($debug_flag);
+	}
+    }
+
+    # delete empty directories.
+    foreach $dir_to_delete (@dirs_to_delete) {
+	# delete if empty, ignore errors unless debug_flag is set.
+	print "DEBUG: removing dir $dir_to_delete.\n" if ($debug_flag);
+	if (!rmdir ($dir_to_delete)) {
+	    print "DEBUG: could not remove dir $dir_to_delete. $!\n" if ($debug_flag);
+	}
+    }
+
+    # delete the package registration files and directory.
+    if (!unlink ("/var/db/pkg/$file/+CONTENTS")) {
+	print "Could not remove package registration +CONTENTS. $!\n";
+    }
+    if (!unlink ("/var/db/pkg/$file/+DESC")) {
+	print "Could not remove package registration +DESC. $!\n";
+    }
+    if (!rmdir ("/var/db/pkg/$file")) {
+	print "Could not remove package registration /var/db/pkg/$file. $!\n";
+	return 0;
+    }
+    
+    print "Deleting package $file.\n";
+    return 1;
 }
 
 # Extract contents of a signed package and return the contents list.
@@ -517,6 +795,9 @@ sub verify_and_extract_package {
 
     return (@output);
 }
+
+### Following subroutines are taken from distribute.pl and should be kept
+### consistent.
 
 # Subroutine used in both distribute.pl and install.pl, be sure to keep
 # consistent.
@@ -574,4 +855,83 @@ sub verify_signature {
     }
     print "@errors";
     return 0;
+}
+
+# Subroutine used in both distribute.pl and install.pl, be sure to keep
+# consistent.
+# Returns 1 if $version1 > $version2.
+sub version_gt {
+    my ($version1, $version2) = @_;
+    
+    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = &version_parse ($version1);
+    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = &version_parse ($version2);
+
+    return 1 if ($v1_major > $v2_major);
+    return 0 if ($v1_major < $v2_major);
+    return 1 if ($v1_minor > $v2_minor);
+    return 0 if ($v1_minor < $v2_minor);
+    return 1 if ($v1_patch > $v2_patch);
+    return 0 if ($v2_patch < $v2_patch);
+    return 1 if ($v1_vv gt $v2_vv);
+    return 0 if ($v1_vv lt $v2_vv);
+    return 1 if ($v1_portrevision gt $v2_portrevision);
+    return 0;
+}
+
+# Subroutine used in both distribute.pl and install.pl, be sure to keep
+# consistent.
+# Parses versions.
+# maj.min.pat(pN)(vN) (Many OpenBSD ports: 3.11.10p0, 9.20.8p0v3, 9.20.9v3)
+# maj.min(alpha)(pN) (reportnew, py3-packaging)
+# yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
+# maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
+# Doesn't support perl's vMAJOR.MINOR.PATcH
+sub version_parse {
+    my ($version) = @_;
+    my ($major, $minor, $patch, $portrevision, $v_epoch);
+
+    $portrevision = -1; # if not found
+
+    # maj.min.pat(pN)(vN)
+    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$portrevision = $4 if (defined ($4));
+	$v_epoch = $5 if (defined ($5));
+    }
+    # maj.min(alpha)(pN) (reportnew, py3-packaging)
+    elsif ($version =~ /^(\d+)\.(\d+)([a-o])*(p\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$v_epoch = $3 if (defined ($3));
+	$portrevision = $4 if (defined ($4));
+    }
+    # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]*)(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$v_epoch = $4 if (defined ($4)); # alpha
+	$portrevision = $5 if (defined ($5));
+	# alpha & vN - if really need both, should break out alpha?
+	if (defined ($6) && defined ($v_epoch)) {
+	    die "Cannot parse version \"$version\". Match on both an alpha patch and vN.\n";
+	}
+	# vN
+	$v_epoch = $6 if (defined ($6));
+    }
+    # maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
+    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)*(v\d+)*$/) {
+	$major = $1;
+	$minor = $2;
+	$patch = $3;
+	$portrevision = $4 if (defined ($4));
+	$v_epoch = $5 if (defined ($5));
+    }
+    else {
+	die "Cannot parse version \"$version\".\n";
+    }
+
+    return ($major, $minor, $patch, $portrevision, $v_epoch);
 }

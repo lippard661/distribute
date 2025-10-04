@@ -88,6 +88,8 @@
 # Modified 22 September 2025 by Jim Lippard to clean up some regexes and fix bug in
 #    processing multiple files.
 # Modified 24 September 2025 by Jim Lippard to complain if -h leads to no matches.
+# Modified 2 October 2025 by Jim Lippard to change $vv variable name to
+#    $v_epoch (OpenBSD Makefile term).
 
 use strict;
 use Archive::Tar;
@@ -825,7 +827,7 @@ sub version_gt {
 # Doesn't support perl's vMAJOR.MINOR.PATcH
 sub version_parse {
     my ($version) = @_;
-    my ($major, $minor, $patch, $portrevision, $vv);
+    my ($major, $minor, $patch, $portrevision, $v_epoch);
 
     $portrevision = -1; # if not found
 
@@ -835,13 +837,13 @@ sub version_parse {
 	$minor = $2;
 	$patch = $3;
 	$portrevision = $4 if (defined ($4));
-	$vv = $5 if (defined ($5));
+	$v_epoch = $5 if (defined ($5));
     }
     # maj.min(alpha)(pN) (reportnew, py3-packaging)
     elsif ($version =~ /^(\d+)\.(\d+)([a-o])*(p\d+)*$/) {
 	$major = $1;
 	$minor = $2;
-	$vv = $3 if (defined ($3));
+	$v_epoch = $3 if (defined ($3));
 	$portrevision = $4 if (defined ($4));
     }
     # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
@@ -849,14 +851,14 @@ sub version_parse {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
-	$vv = $4 if (defined ($4)); # alpha
+	$v_epoch = $4 if (defined ($4)); # alpha
 	$portrevision = $5 if (defined ($5));
 	# alpha & vN - if really need both, should break out alpha?
-	if (defined ($6) && defined ($vv)) {
+	if (defined ($6) && defined ($v_epoch)) {
 	    die "Cannot parse version \"$version\". Match on both an alpha patch and vN.\n";
 	}
 	# vN
-	$vv = $6 if (defined ($6));
+	$v_epoch = $6 if (defined ($6));
     }
     # maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
     elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)*(v\d+)*$/) {
@@ -864,15 +866,14 @@ sub version_parse {
 	$minor = $2;
 	$patch = $3;
 	$portrevision = $4 if (defined ($4));
-	$vv = $5 if (defined ($5));
+	$v_epoch = $5 if (defined ($5));
     }
     else {
 	die "Cannot parse version \"$version\".\n";
     }
 
-    return ($major, $minor, $patch, $portrevision, $vv);
+    return ($major, $minor, $patch, $portrevision, $v_epoch);
 }
-
 
 # Subroutine to get signify passphrase.
 sub get_signify_passphrase {
