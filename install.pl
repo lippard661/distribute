@@ -557,6 +557,15 @@ sub minimal_pkg_add {
 	# register package, ignoring errors
 	$tar->extract_file('+CONTENTS', "/var/db/pkg/$file_minus_tgz/+CONTENTS");
 	$tar->extract_file('+DESC', "/var/db/pkg/$file_minus_tgz/+DESC");
+	if ($tar->contains_file('+DISPLAY')) {
+	    $tar->extract_file('+DISPLAY', "/var/db/pkg/$file_minus_tgz/+DISPLAY");
+	    if (open (FILE, '<', "/var/db/pkg/$file_minus_tgz/+DISPLAY")) {
+		while (<FILE>) {
+		    print "$_";
+		}
+		close (FILE);
+	    }
+	}
 	return 1;
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
@@ -732,6 +741,7 @@ sub minimal_pkg_delete {
     # delete files.
     foreach $file_to_delete (@files_to_delete) {
 	print "DEBUG: removing $file_to_delete.\n" if ($debug_flag);
+	# could check SHA256 before deletion, if so, should build a subroutine for it.
 	if (!unlink ($file_to_delete)) {
 	    print "DEBUG: could not remove $file_to_delete. $!\n" if ($debug_flag);
 	}
@@ -752,6 +762,9 @@ sub minimal_pkg_delete {
     }
     if (!unlink ("/var/db/pkg/$file/+DESC")) {
 	print "Could not remove package registration +DESC. $!\n";
+    }
+    if (-e "/var/db/pkg/$file/+DISPLAY" && !unlink ("/var/db/pkg/$file/+DISPLAY")) {
+	print "Could not remove package registration +DISPLAY. $!\n";
     }
     if (!rmdir ("/var/db/pkg/$file")) {
 	print "Could not remove package registration /var/db/pkg/$file. $!\n";
