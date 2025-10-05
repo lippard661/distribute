@@ -49,6 +49,15 @@
 # Modified 2 October 2025 by Jim Lippard to correct check for already-installed
 #    package and to make the minimal pkg_add equivalent create /var/db/pkg
 #    registrations.
+# Modified 3-4 October 2025 by Jim Lippard to add minimal pkg_delete functionality
+#    for updating and removing old /var/db/pkg registrations, install sample config
+#    file and use macos/linux version if available, don't remove them if modified
+#    per file size or SHA256, fix bugs and test, set timestamps and change gid for
+#    minimal pkg_add, do some minimal file path validation. Groundwork now allows
+#    for fairly simple creation of pkg_info and pkg_check functionality (separate).
+#    Ultimately the minimal pkg_add/pkg_delete should be separated out to its own
+#    module that more fully parses the +CONTENTS file and maybe does some dependency
+#    checking.
 
 use strict;
 use Archive::Tar;
@@ -490,10 +499,10 @@ sub minimal_pkg_add {
 
     foreach $line (@lines) {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
-	    if ($line =~ /\/$/) { # lines ending in / are dirs
+	    if ($line =~ /\/$/ && &valid_filepath ($line)) { # lines ending in / are dirs
 		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
 	    }
-	    else { # otherwise it's a file
+	    elsif (&valid_filepath ($line)) { # otherwise it's a file
 		$last_file = $line;
 		if ($line =~ /^$OPENBSD_PERL/) {
 		    $substitute_line = $line;
@@ -513,6 +522,9 @@ sub minimal_pkg_add {
 		    push (@files_to_extract, $line);
 		}
 	    }
+	    else {
+		die "Aborting due to unusual line in $file +CONTENTS. $line\n";
+	    }
 	}
 	# timestamps
 	elsif ($line =~ /^\@ts (\d+)$/) {
@@ -520,6 +532,9 @@ sub minimal_pkg_add {
 	}
 	elsif ($line =~ /^\@sample (.*)$/) {
 	    $sample_file = $1;
+	    if (!&valid_filepath ($sample_file)) {
+		die "Aborting due to unusual \@sample file path in $file +CONTENTS. $line\n";
+	    }
 	    # Trailing / is a dir to create, most likely in /etc.
 	    if ($sample_file =~ /\/$/) {
 		push (@dirs_to_create, $sample_file) unless (-e $sample_file);
@@ -627,6 +642,20 @@ sub minimal_pkg_add {
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
     return 0;
+}
+
+# Subroutine to determine if a string is a valid file path.
+sub valid_filepath {
+    my ($path) = @_;
+
+    # no directory traversal
+    return 0 if ($path =~ /\.\./);
+
+    # no odd characters (just alphanumeric, underscore, dot, slash, plus, at-sign, tilde, parens, space)
+    # this covers all packages I have installed; only one has parens and a space.
+    return 0 if ($path !~ /^[\w\-\.\/\+\@~\(\) ]+$/);
+
+    return 1;
 }
 
 # Subroutine to set timestamps and fix gid.
