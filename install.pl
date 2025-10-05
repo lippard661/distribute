@@ -54,6 +54,7 @@ use strict;
 use Archive::Tar;
 use Cwd;
 use File::Basename qw(fileparse basename dirname);
+use File::Copy qw(copy);
 use File::Path qw(rmtree make_path);
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
@@ -286,7 +287,8 @@ if ($use_syslock) {
     }
 }
 
-# Create temp dir. Needed only for signature verification.
+# Create temp dir. Needed for signature verification and for altering
+# package +CONTENTS files for minimal_pkg_add.
 if ($^O eq 'openbsd') {
     $temp_dir = mkdtemp ('/tmp/install.XXXXXXX');
 }
@@ -405,11 +407,17 @@ sub install_pkg_add {
 # Return 1 for success, 0 for failure.
 sub minimal_pkg_add {
     my ($file) = @_;
-    my ($tar, $file_minus_tgz, $content, @lines, $line,
-	@files_to_extract, @dirs_to_create,
+    my ($tar, $file_minus_tgz, $content, @lines, $line, $last_file,
+	@files_to_extract, @dirs_to_create, $file_extracted, %file_ts,
 	$sample_file, $sample_source_file, %samples_to_extract,
-	$dir, $older_package);
+	$dir, $older_package, %substitute_extract, $substitute_line,
+	$substitute_file, $substitute_linux, $substitute_macos);
     my $DIR_PREFIX = '/usr/local';
+    my $OPENBSD_PERL = 'libdata/perl5/site_perl';
+    my $LINUX_PERL = 'lib/site_perl';
+    my $PERLV = $^V;
+    $PERLV =~ s/^v//;
+    my $MACOS_PERL = "/Library/Perl/Updates/$PERLV";
 
     # Read package as Tar file.
     $tar = Archive::Tar->new;
@@ -486,8 +494,29 @@ sub minimal_pkg_add {
 		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
 	    }
 	    else { # otherwise it's a file
-		push (@files_to_extract, $line);
+		$last_file = $line;
+		if ($line =~ /^$OPENBSD_PERL/) {
+		    $substitute_line = $line;
+		    if ($^O eq 'linux') {
+			$substitute_line =~ s/^$OPENBSD_PERL/$LINUX_PERL/;
+			$substitute_linux = 1;
+			push (@dirs_to_create, $LINUX_PERL) if (!-e "$DIR_PREFIX/$LINUX_PERL");
+		    }
+		    elsif ($^O eq 'darwin') {
+			$substitute_line =~ s/^$OPENBSD_PERL/$MACOS_PERL/;
+			$substitute_macos = 1;
+			push (@dirs_to_create, $MACOS_PERL) if (!-e $MACOS_PERL);
+		    }
+		    $substitute_extract{$line} = $substitute_line;
+		}
+		else {
+		    push (@files_to_extract, $line);
+		}
 	    }
+	}
+	# timestamps
+	elsif ($line =~ /^\@ts (\d+)$/) {
+	    $file_ts{$last_file} = $1;
 	}
 	elsif ($line =~ /^\@sample (.*)$/) {
 	    $sample_file = $1;
@@ -499,7 +528,7 @@ sub minimal_pkg_add {
 	    # Will typically be last file from @files_to_extract. Key is
 	    # file in tar file, value is full path of destination.
 	    else {
-		$samples_to_extract{$files_to_extract[-1]} = $sample_file;
+		$samples_to_extract{$last_file} = $sample_file;
 	    }
 	}
     }
@@ -509,6 +538,7 @@ sub minimal_pkg_add {
     $tar->setcwd ( cwd() );
 
     print "DEBUG: creating any required directories\n" if ($debug_flag);
+    print "DEBUG: \@dirs_to_create = @dirs_to_create\n" if ($debug_flag);
     foreach $dir (@dirs_to_create) {
 	if (!make_path ("$DIR_PREFIX/$dir")) {
 	    print "Couldn't create required directory. $! $DIR_PREFIX/$dir\n";
@@ -520,9 +550,32 @@ sub minimal_pkg_add {
     }
 
     print "DEBUG: extracting package from tar file $file\n" if ($debug_flag);
-    if ($tar->extract(@files_to_extract)) {
+    print "DEBUG: \@files_to_extract = @files_to_extract\n" if ($debug_flag);
+    if ((@files_to_extract && $tar->extract (@files_to_extract)) ||
+	$substitute_linux || $substitute_macos) {
+	# Set timestamps.
+	foreach $file_extracted (@files_to_extract) {
+	    &set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted});
+	}
 	print "Installed package $file.\n";
-	# Extract any sample files.
+	# Extract any perl modules. (This can occur when there are no
+	# other files to extract.)
+	if ($substitute_linux || $substitute_macos) {
+	    print "DEBUG: extracting perl modules to alternate path\n" if ($debug_flag);
+	    foreach $substitute_file (keys (%substitute_extract)) {
+		print "DEBUG: extracting $substitute_file to $substitute_extract{$substitute_file}\n" if ($debug_flag);
+		if (!$tar->extract_file ($substitute_file, $substitute_extract{$substitute_file})) {
+		    print "DEBUG: could not extract $substitute_file to $substitute_extract{$substitute_file}. $!\n" if ($debug_flag);
+		}
+		else { # set timestamp, and fix gid for Linux
+		    &set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file}) if ($substitute_linux);
+		    # already an absolute path for macOS.
+		    &set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file}) if ($substitute_macos)
+		}
+	    }
+	}
+	# Extract any sample files. (Assumption: never happens unless there
+	# are other files to extract, otherwise this code won't be reached.)
 	print "DEBUG: extracting sample files\n" if ($debug_flag);
 	foreach $sample_file (keys (%samples_to_extract)) {
 	    if (!-e $samples_to_extract{$sample_file}) {
@@ -541,7 +594,9 @@ sub minimal_pkg_add {
 		}
 		
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
-		$tar->extract ($sample_source_file, $samples_to_extract{$sample_file});
+		$tar->extract_file ($sample_source_file, $samples_to_extract{$sample_file});
+		# sample files are already an absolute path so no $DIR_PREFIX.
+		&set_timestamp ($samples_to_extract{$sample_file}, $file_ts{$sample_file});
 	    }
 	    else {
 		print "DEBUG: not extracting sample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
@@ -556,6 +611,8 @@ sub minimal_pkg_add {
 	}
 	# register package, ignoring errors
 	$tar->extract_file('+CONTENTS', "/var/db/pkg/$file_minus_tgz/+CONTENTS");
+	&update_package_contents_file ("/var/db/pkg/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $LINUX_PERL) if ($substitute_linux);
+	&update_package_contents_file ("/var/db/pkg/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $MACOS_PERL) if ($substitute_macos);
 	$tar->extract_file('+DESC', "/var/db/pkg/$file_minus_tgz/+DESC");
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "/var/db/pkg/$file_minus_tgz/+DISPLAY");
@@ -570,6 +627,53 @@ sub minimal_pkg_add {
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
     return 0;
+}
+
+# Subroutine to set timestamps and fix gid.
+sub set_timestamp {
+    my ($file, $timestamp) = @_;
+    my ($atime, $gid);
+
+    $atime = time();
+
+    if ($timestamp == 0) {
+	print "DEBUG: 0 timestamp for file $file\n" if ($debug_flag);
+    }
+    else {
+	if (!utime ($atime, $timestamp, $file)) {
+	    print "DEBUG: could not set timestamp $timestamp on file $file. $!\n" if ($debug_flag);
+	}
+    }
+
+    if ($^O eq 'linux') {
+	# bin is 7 on *BSD and macOS, but 2 on Linux, so fix.
+	$gid = getgrnam ('bin');
+	chown (-1, $gid, $file);
+    }
+}
+
+# Update package +CONTENTS file with altered paths for perl modules
+# for Linux or macOS.  For macOS it's an absolute path and minimal_pkg_delete
+# needs to make note of it.
+sub update_package_contents_file {
+    my ($file, $original, $substitution) = @_;
+
+    if (open (FILE, '<', $file)) { # open input +CONTENTS
+	if (open (TEMP, '>', "$temp_dir/+CONTENTS")) { # open temp +CONTENTS
+	    while (<FILE>) {
+		if (!/^[\@\+]/) {
+		    if (/^$original/) {
+			$_ =~ s/^$original/$substitution/;
+		    }
+		}
+		print TEMP $_;
+	    } # while
+	    close (FILE);
+	    close (TEMP);
+	    copy ("$temp_dir/+CONTENTS", $file);
+	    unlink ("$temp_dir/+CONTENTS");
+	} # open temp +CONTENTS
+    } # open input +CONTENTS
 }
 
 # Is an older version of a package installed?
@@ -654,7 +758,13 @@ sub minimal_pkg_delete {
 		push (@dirs_to_delete, "$DIR_PREFIX/$_");
 	    }
 	    else { # otherwise it's a file
-		push (@files_to_delete, "$DIR_PREFIX/$_");
+		# macOS puts perl modules into absolute path.
+		if ($^O eq 'macos' && substr ($_, 0, 1) eq '/') {
+		    push (@files_to_delete, $_);
+		}
+		else {
+		    push (@files_to_delete, "$DIR_PREFIX/$_");
+		}
 	    }
 	}
 	# @sample is already a full path.
