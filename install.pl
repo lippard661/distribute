@@ -49,15 +49,17 @@
 # Modified 2 October 2025 by Jim Lippard to correct check for already-installed
 #    package and to make the minimal pkg_add equivalent create /var/db/pkg
 #    registrations.
-# Modified 3-4 October 2025 by Jim Lippard to add minimal pkg_delete functionality
-#    for updating and removing old /var/db/pkg registrations, install sample config
-#    file and use macos/linux version if available, don't remove them if modified
-#    per file size or SHA256, fix bugs and test, set timestamps and change gid for
-#    minimal pkg_add, do some minimal file path validation. Groundwork now allows
-#    for fairly simple creation of pkg_info and pkg_check functionality (separate).
-#    Ultimately the minimal pkg_add/pkg_delete should be separated out to its own
-#    module that more fully parses the +CONTENTS file and maybe does some dependency
-#    checking.
+# Modified 3-4 October 2025 by Jim Lippard to add minimal pkg_delete
+#    functionality for updating and removing old /var/db/pkg registrations,
+#    install sample config file and use macos/linux version if available, don't
+#    remove them if modified per file size or SHA256, fix bugs and test, set
+#    timestamps and change gid for  minimal pkg_add, do some minimal file path
+#    validation. Groundwork now allows for fairly simple creation of pkg_info
+#    and pkg_check functionality (separate).
+#    Ultimately the minimal pkg_add/pkg_delete should be separated out to its
+#    own module that more fully parses the +CONTENTS file and maybe does some
+#    dependency checking.
+# Modified 10 November 2025 by Jim Lippard to unveil /dev/null for Signify.
 
 use strict;
 use Archive::Tar;
@@ -209,7 +211,6 @@ if ($^O eq 'openbsd') {
     }
     
     # Unveil commands used.
-    # removed $MKTEMP.
     unveil ($PKG_ADD, 'rx');
     unveil ($PWD, 'rx'); # not sure what calls this
     unveil ($SIGNIFY, 'rx');
@@ -219,6 +220,8 @@ if ($^O eq 'openbsd') {
 
     # Unveil signify pub key dir (could also update!)
     unveil ($SIGNIFY_PUB_KEY_DIR, 'rwc');
+    # Unveil for Signify gzip verification.
+    unveil ('/dev/null', 'rwc');
 
     # Unveil files modified.
     unveil ($INSTALL_DIR, "rwxc");
