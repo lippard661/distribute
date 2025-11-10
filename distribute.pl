@@ -90,6 +90,7 @@
 # Modified 24 September 2025 by Jim Lippard to complain if -h leads to no matches.
 # Modified 2 October 2025 by Jim Lippard to change $vv variable name to
 #    $v_epoch (OpenBSD Makefile term).
+# Modified 9 November 2025 by Jim Lippard to unveil /dev/null for Signify.pm.
 
 use strict;
 use Archive::Tar;
@@ -339,6 +340,9 @@ if ($^O eq 'openbsd') {
 
     # Signify keys.
     unveil ($SIGNIFY_PUB_KEY_DIR, 'r');
+
+    # For Signify gzip verification.
+    unveil ('/dev/null', 'rwc');
 
     # Installation dir and temp dir.
     unveil ($INSTALL_DIR, 'rwc');
