@@ -60,6 +60,11 @@
 #    own module that more fully parses the +CONTENTS file and maybe does some
 #    dependency checking.
 # Modified 10 November 2025 by Jim Lippard to unveil /dev/null for Signify.
+# Modified 11 November 2025 by Jim Lippard to use /var/installation on macOS
+#    because /var/install already exists and is protected. (No support in
+#    distribute.pl for macOS destinations.) Use $PKG_DIR for /var/db/pkg,
+#    create it before looking for prior package versions to delete if it
+#    doesn't already exist.
 
 use strict;
 use Archive::Tar;
@@ -84,6 +89,9 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 ### Constants.
 
 my $INSTALL_DIR = '/var/install';
+my $INSTALL_DIR = '/var/installation' if $^O eq 'darwin';
+
+my $PKG_DIR = '/var/db/pkg';
 
 my @DEST_LOCATIONS = (
     '/etc',
@@ -99,7 +107,7 @@ my @SYSLOCK_GROUPS = (
 my $MKTEMP = '/usr/bin/mktemp';
 my $PKG_ADD = '/usr/sbin/pkg_add';
 my $PWD = '/bin/pwd';
-my $SIGNIFY = '/usr/bin/signify';
+my $SIGNIFY = '/usr/bin/signify'; # used only for unveil, for Signify.pm
 my $SYSCTL = '/usr/sbin/sysctl';
 my $SYSLOCK = '/usr/local/bin/syslock';
 my $SYSUNLOCK = '/usr/local/bin/sysunlock';
@@ -476,6 +484,14 @@ sub minimal_pkg_add {
 	return 0;
     }
 
+    if (!-e $PKG_DIR) {
+	print "DEBUG: creating $PKG_DIR\n" if ($debug_flag);
+	if (!make_path ("$PKG_DIR")) {
+	    print "Couldn't create $PKG_DIR. $!\n";
+	    return 0; # didn't get to installation
+	}
+    }
+
     # Is a prior version of this package already installed? If so, remove it,
     # but don't touch @sample dirs and files unless the files are unchanged
     # since install.
@@ -622,19 +638,19 @@ sub minimal_pkg_add {
 	}
 	
 	# Register the installation.
-	print "DEBUG: creating /var/db/pkg registration\n" if ($debug_flag);
-	if (!make_path ("/var/db/pkg/$file_minus_tgz")) {
-	    print "Couldn't create /var/db/pkg/$file_minus_tgz. $!\n";
+	print "DEBUG: creating $PKG_DIR registration\n" if ($debug_flag);
+	if (!make_path ("$PKG_DIR/$file_minus_tgz")) {
+	    print "Couldn't create $PKG_DIR/$file_minus_tgz. $!\n";
 	    return 1; # actual installation worked
 	}
 	# register package, ignoring errors
-	$tar->extract_file('+CONTENTS', "/var/db/pkg/$file_minus_tgz/+CONTENTS");
-	&update_package_contents_file ("/var/db/pkg/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $LINUX_PERL) if ($substitute_linux);
-	&update_package_contents_file ("/var/db/pkg/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $MACOS_PERL) if ($substitute_macos);
-	$tar->extract_file('+DESC', "/var/db/pkg/$file_minus_tgz/+DESC");
+	$tar->extract_file('+CONTENTS', "$PKG_DIR/$file_minus_tgz/+CONTENTS");
+	&update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $LINUX_PERL) if ($substitute_linux);
+	&update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $MACOS_PERL) if ($substitute_macos);
+	$tar->extract_file('+DESC', "$PKG_DIR/$file_minus_tgz/+DESC");
 	if ($tar->contains_file('+DISPLAY')) {
-	    $tar->extract_file('+DISPLAY', "/var/db/pkg/$file_minus_tgz/+DISPLAY");
-	    if (open (FILE, '<', "/var/db/pkg/$file_minus_tgz/+DISPLAY")) {
+	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
+	    if (open (FILE, '<', "$PKG_DIR/$file_minus_tgz/+DISPLAY")) {
 		while (<FILE>) {
 		    print "$_";
 		}
@@ -734,12 +750,12 @@ sub older_package_installed {
 	return 0;
     }
 
-    if (opendir (DIR, '/var/db/pkg')) {
+    if (opendir (DIR, $PKG_DIR)) {
 	@files = grep (!/^\.{1,2}$/, readdir (DIR));
 	closedir (DIR);
     }
     else {
-	print "Cannot open dir /var/db/pkg. $!\n";
+	print "Cannot open dir $PKG_DIR. $!\n";
 	return 0;
     }
 
@@ -782,7 +798,7 @@ sub minimal_pkg_delete {
 
     # Read +CONTENTS, looking for dirs and files to delete and sample files
     # to potentially delete.
-    open (FILE, '<', "/var/db/pkg/$file/+CONTENTS");
+    open (FILE, '<', "$PKG_DIR/$file/+CONTENTS");
     while (<FILE>) {
 	chomp;
 	if (!/^[\@\+]/) { # lines not beginning with @ or +
@@ -899,16 +915,16 @@ sub minimal_pkg_delete {
     }
 
     # delete the package registration files and directory.
-    if (!unlink ("/var/db/pkg/$file/+CONTENTS")) {
+    if (!unlink ("$PKG_DIR/$file/+CONTENTS")) {
 	print "Could not remove package registration +CONTENTS. $!\n";
     }
-    if (!unlink ("/var/db/pkg/$file/+DESC")) {
+    if (!unlink ("$PKG_DIR/$file/+DESC")) {
 	print "Could not remove package registration +DESC. $!\n";
     }
-    if (-e "/var/db/pkg/$file/+DISPLAY" && !unlink ("/var/db/pkg/$file/+DISPLAY")) {
+    if (-e "$PKG_DIR/$file/+DISPLAY" && !unlink ("/var/db/pkg/$file/+DISPLAY")) {
 	print "Could not remove package registration +DISPLAY. $!\n";
     }
-    if (!rmdir ("/var/db/pkg/$file")) {
+    if (!rmdir ("$PKG_DIR/$file")) {
 	print "Could not remove package registration /var/db/pkg/$file. $!\n";
 	return 0;
     }
