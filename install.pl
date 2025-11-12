@@ -89,7 +89,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 ### Constants.
 
 my $INSTALL_DIR = '/var/install';
-my $INSTALL_DIR = '/var/installation' if $^O eq 'darwin';
+$INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
 
 my $PKG_DIR = '/var/db/pkg';
 
