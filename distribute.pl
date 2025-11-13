@@ -91,6 +91,8 @@
 # Modified 2 October 2025 by Jim Lippard to change $vv variable name to
 #    $v_epoch (OpenBSD Makefile term).
 # Modified 9 November 2025 by Jim Lippard to unveil /dev/null for Signify.pm.
+# Modified 13 November 2025 by Jim Lippard to not allow OpenBSD signing
+#    keys if not on OpenBSD.
 
 use strict;
 use Archive::Tar;
@@ -150,9 +152,16 @@ my $PRIOR_SIGNIFY_PUB_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.pub";
 my $SIGNIFY_KEY_NEXT_NAME = "$DOMAINNAME-$next_year-pkg";
 my $SIGNIFY_PUB_KEY_NEXT = "$SIGNIFY_PUB_KEY_DIR/$SIGNIFY_KEY_NEXT_NAME.pub";
 my $SIGNIFY_MIN_YEAR = $prev_year;
-my $current_openbsd = `$UNAME -a`;
-$current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
-$current_openbsd--; 
+my $current_openbsd;
+if ($^O eq 'openbsd') {
+    $current_openbsd = `$UNAME -a`;
+    $current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
+    $current_openbsd--;
+}
+else {
+    $current_openbsd = 'not-openbsd';
+}
+    
 my $OPENBSD_MIN_VERSION = "$current_openbsd";
 
 my $CONFIG_FILE = '/etc/distribute.conf';
@@ -1276,7 +1285,7 @@ sub verify_signature {
 		$num = $2;
 		# Gotta meet minimum version requirements.
 		if (($key_type eq $DOMAINNAME && $num >= $SIGNIFY_MIN_YEAR) ||
-		    ($key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
+		    ($^O eq 'openbsd' && $key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
 		    return 1; # all good
 		}
 		# Didn't meet minimum version requirements

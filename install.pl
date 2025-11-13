@@ -65,6 +65,8 @@
 #    distribute.pl for macOS destinations.) Use $PKG_DIR for /var/db/pkg,
 #    create it before looking for prior package versions to delete if it
 #    doesn't already exist.
+# Modified 13 November 2025 by Jim Lippard to not allow OpenBSD signing
+#    keys if not on OpenBSD.
 
 use strict;
 use Archive::Tar;
@@ -132,9 +134,17 @@ my $SIGNIFY_MIN_YEAR = $prev_year;
 my $PRIOR_SIGNIFY_KEY_NAME = "$DOMAINNAME-$prev_year-pkg";
 my $PRIOR_SIGNIFY_SEC_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.sec";
 my $PRIOR_SIGNIFY_PUB_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.pub";
-my $current_openbsd = `$UNAME -a`;
-$current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
-$current_openbsd--;
+
+my $current_openbsd;
+
+if ($^O eq 'openbsd') {
+    $current_openbsd = `$UNAME -a`;
+    $current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
+    $current_openbsd--;
+}
+else {
+    my $current_openbsd = 'not-openbsd';
+}
 my $OPENBSD_MIN_VERSION = "$current_openbsd";
 
 my $THREE_SPACES = '   ';
@@ -1013,7 +1023,7 @@ sub verify_signature {
 		$num = $2;
 		# Gotta meet minimum version requirements.
 		if (($key_type eq $DOMAINNAME && $num >= $SIGNIFY_MIN_YEAR) ||
-		    ($key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
+		    ($^O eq 'openbsd' && $key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
 		    return 1; # all good
 		}
 		# Didn't meet minimum version requirements
