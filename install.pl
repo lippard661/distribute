@@ -67,6 +67,8 @@
 #    doesn't already exist.
 # Modified 13 November 2025 by Jim Lippard to not allow OpenBSD signing
 #    keys if not on OpenBSD.
+# Modified 1 January 2026 by Jim Lippard to fix bug in &verify_signature
+#    when using secondary keys (pubkey dir no longer recorded).
 
 use strict;
 use Archive::Tar;
@@ -1013,7 +1015,7 @@ sub verify_signature {
 		return 0;
 	    }
 	    ($signer_key_file, $signer_key_dir) = fileparse ($signer);
-	    if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR) {
+	    if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
 		print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
 		return 0;
 	    }
