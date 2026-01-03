@@ -95,6 +95,9 @@
 #    keys if not on OpenBSD.
 # Modified 1 January 2026 by Jim Lippard to fix bug in &verify_signature
 #    when using secondary keys (pubkey dir no longer recorded).
+# Modified 3 January 2026 by Jim Lippard to check for existence of current
+#    year signing key and warn about next year's signing key 30 days in
+#    advance.
 
 use strict;
 use Archive::Tar;
@@ -304,6 +307,18 @@ if ($opts{'h'}) {
 # Get the date (YYMMDD-HHMMSS).
 $date = strftime ("%Y%m%d-%H%M%s", localtime (time()));
 print "DEBUG: getting date: $date\n" if ($debug_flag);
+
+# Abort if current year signing key is missing and not using prior year key.
+# Warn about missing current year signing key (abort unless using prior year
+# key) and missing next year signing key if month is December.
+if (!-e $SIGNIFY_SEC_KEY) {
+    die "Current year signing key $SIGNIFY_SEC_KEY does not exist.\n" unless ($use_prev_year_key);
+    print "Warning: Current year signing key $SIGNIFY_SEC_KEY does not exist.\n";
+}
+# Check next year's public key existence.
+if (!-e $SIGNIFY_PUB_KEY_NEXT && $date =~ /^..12/) {
+    print "Warning: Next year's signing key and public key $SIGNIFY_PUB_KEY_NEXT do not exist.\n";
+}
 
 # Use pledge and unveil.
 # Already got the date so don't need /usr/share/zoneinfo.
