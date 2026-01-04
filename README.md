@@ -3,9 +3,9 @@ install.pl includes minimal functionality to support installing OpenBSD packages
 similar to OpenBSD's pkg_add and pkg_delete.
 pkg_info.pl is a minimal implementation of OpenBSD's pkg_info to go along with that.
 
-Current version of distribute.pl from 3 January 2026.
+Current version of distribute.pl from 4 January 2026.
 Current version of distribute.conf from 14 September 2025.
-Current version of install.pl from 3 January 2026.
+Current version of install.pl from 4 January 2026.
 Current version of pkg_info.pl from 4 January 2026.
 
 Intended primarily for OpenBSD hosts that use immutable file systems, but also works on Linux, I use it with Proxmox (Debian), Kali Linux, and macOS.
