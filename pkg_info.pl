@@ -4,6 +4,7 @@
 # Completely superfluous on OpenBSD, but can be used on Linux or macOS
 # in conjunction with install.pl.
 # Written 5 October 2025 by Jim Lippard
+# Modified 4 January 2026 by Jim Lippard to remove & on subroutine calls.
 
 use strict;
 use warnings;
@@ -13,19 +14,19 @@ my $PKG_DIR = '/var/db/pkg';
 my ($arg, $package, @packages);
 
 if ($#ARGV == -1) {
-    &list_all_brief;
+    list_all_brief();
     exit;
 }
 
 foreach $arg (@ARGV) {
-    $package = &find_package ($arg);
+    $package = find_package ($arg);
     push (@packages, $package) if ($package);
 }
 
 die "No valid packages specified.\n" unless (@packages);
 
 foreach $package (@packages) {
-    &show_package_desc ($package);
+    show_package_desc ($package);
 }
 
 # Subroutine to find a matching package name.
@@ -90,4 +91,7 @@ sub show_package_desc {
 	print "$_\n";
     }
     close (FILE);
+
+    # Just to be identical to pkg_info.
+    print "\n\n";
 }
