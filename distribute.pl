@@ -93,7 +93,7 @@
 # Modified 9 November 2025 by Jim Lippard to unveil /dev/null for Signify.pm.
 # Modified 13 November 2025 by Jim Lippard to not allow OpenBSD signing
 #    keys if not on OpenBSD.
-# Modified 1 January 2026 by Jim Lippard to fix bug in &verify_signature
+# Modified 1 January 2026 by Jim Lippard to fix bug in verify_signature
 #    when using secondary keys (pubkey dir no longer recorded).
 # Modified 3 January 2026 by Jim Lippard to check for existence of current
 #    year signing key and warn about next year's signing key 30 days in
