@@ -69,6 +69,8 @@
 #    keys if not on OpenBSD.
 # Modified 1 January 2026 by Jim Lippard to fix bug in &verify_signature
 #    when using secondary keys (pubkey dir no longer recorded).
+# Modified 3 January 2026 by Jim Lippard to warn if next year's public
+#    key hasn't shown up yet by two weeks before the new year.
 
 use strict;
 use Archive::Tar;
@@ -136,6 +138,9 @@ my $SIGNIFY_MIN_YEAR = $prev_year;
 my $PRIOR_SIGNIFY_KEY_NAME = "$DOMAINNAME-$prev_year-pkg";
 my $PRIOR_SIGNIFY_SEC_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.sec";
 my $PRIOR_SIGNIFY_PUB_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.pub";
+my $next_year = $year + 1;
+my $SIGNIFY_KEY_NAME_NEXT = "$DOMAINNAME-$next_year-pkg";
+my $SIGNIFY_PUB_KEY_NEXT = "$SIGNIFY_PUB_KEY_DIR/$SIGNIFY_KEY_NAME_NEXT.pub";
 
 my $current_openbsd;
 
@@ -197,6 +202,13 @@ die "Error. Must be run by root.\n" if ($user ne 'root');
 if (!-e $SYSLOCK) {
    $use_syslock = 0;
    die "Cannot use -f because you don't have syslock.\n" if ($force_flag);
+}
+
+# Warn if next year's key hasn't shown up yet by two weeks before end of year.
+my ($month, $day) = (localtime (time()))[4, 3];
+$month++; # indexes are 0-11.
+if ($month == 12 && $day > 16 &&!-e $SIGNIFY_PUB_KEY_NEXT) {
+    print "Warning: Next year's signing public key $SIGNIFY_PUB_KEY_NEXT isn't on this system.\n";
 }
 
 # Check securelevel if using syslock (and -f force_flag is not used).
