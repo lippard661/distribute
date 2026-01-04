@@ -67,10 +67,11 @@
 #    doesn't already exist.
 # Modified 13 November 2025 by Jim Lippard to not allow OpenBSD signing
 #    keys if not on OpenBSD.
-# Modified 1 January 2026 by Jim Lippard to fix bug in &verify_signature
+# Modified 1 January 2026 by Jim Lippard to fix bug in verify_signature
 #    when using secondary keys (pubkey dir no longer recorded).
 # Modified 3 January 2026 by Jim Lippard to warn if next year's public
 #    key hasn't shown up yet by two weeks before the new year.
+# Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
 
 use strict;
 use Archive::Tar;
@@ -188,7 +189,7 @@ $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
 $debug_flag = $opts{'d'};
 
-die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag & !$use_syslock);
+die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag && !$use_syslock);
 
 if ($#ARGV != -1) {
     die "Usage: install.pl [-f (force)|-n (no syslock)|-d debug]\n";
@@ -298,7 +299,7 @@ if ($use_syslock) {
 		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
 	    }
 	    else {
-		@errors = Signify::signify_error;
+		@errors = Signify::signify_error();
 		print "Bad signature on group file. $INSTALL_DIR/$file.sig @errors";
 	    }
 	    # Remove sig file.
@@ -348,7 +349,7 @@ else {
 #    Install using pkg_add.
 foreach $file (@files) {
     if ($file =~ /^$host-\d+-\d+-package\.tgz$/) {
-	@contents = &verify_and_extract_package ("$INSTALL_DIR/$file");
+	@contents = verify_and_extract_package ("$INSTALL_DIR/$file");
 	# Remove file and create CHANGELOG entry if successfully installed.
 	if ($contents[0]) {
 	    unlink ("$INSTALL_DIR/$file");
@@ -367,7 +368,7 @@ foreach $file (@files) {
 	    unlink ("$INSTALL_DIR/$file");
 	}
 	# Remove file and create CHANGELOG entry if successfully installed.
-	elsif (&install_pkg_add ("$INSTALL_DIR/$file")) {
+	elsif (install_pkg_add ("$INSTALL_DIR/$file")) {
 	    unlink ("$INSTALL_DIR/$file");
 	    
 	    # Create CHANGELOG entry.
@@ -420,14 +421,14 @@ close (FILE);
 sub install_pkg_add {
     my ($file) = @_;
 
-    if (!&verify_signature ($file)) {
+    if (!verify_signature ($file)) {
 	print "Invalid or missing signature. Could not install package $file.\n";
 	return;
     }
 
     if ($^O ne 'openbsd' && !-e $PKG_ADD) {
 	print "DEBUG: installing package $file with builtin minimal pkg_add.\n" if ($debug_flag);
-	return 1 if (&minimal_pkg_add ($file)); # success
+	return 1 if (minimal_pkg_add ($file)); # success
 	return 0; # failure
     }
 
@@ -471,7 +472,7 @@ sub minimal_pkg_add {
     }
     
     # Do another signify verification post-tar-read to mitigate TOCTOU race.
-    if (!&verify_signature ($file)) {
+    if (!verify_signature ($file)) {
 	print "Invalid or missing signature. Could not install package $file.\n";
 	return;
     }
@@ -525,13 +526,13 @@ sub minimal_pkg_add {
     # (3) Process in reverse (files to remove, directories to remove if empty,
     #     files to remove if unchanged, checking for custom installed configs
     #     for macOS/linux.
-    if ($older_package = &older_package_installed ($file)) {
+    if ($older_package = older_package_installed ($file)) {
 	if ($older_package =~ /^newer:(.*)$/) {
 	    print "Newer package $1 already installed.\n";
 	    return 0;
 	}
 	print "DEBUG: deleting package $older_package with builtin minimal pkg_delete.\n" if ($debug_flag);
-	if (!&minimal_pkg_delete ($older_package)) {
+	if (!minimal_pkg_delete ($older_package)) {
 	    print "Package delete of $older_package failed. Not installing $file.\n";
 	    return 0;
 	}
@@ -542,10 +543,10 @@ sub minimal_pkg_add {
 
     foreach $line (@lines) {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
-	    if ($line =~ /\/$/ && &valid_filepath ($line)) { # lines ending in / are dirs
+	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
 		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
 	    }
-	    elsif (&valid_filepath ($line)) { # otherwise it's a file
+	    elsif (valid_filepath ($line)) { # otherwise it's a file
 		$last_file = $line;
 		if ($line =~ /^$OPENBSD_PERL/) {
 		    $substitute_line = $line;
@@ -575,7 +576,7 @@ sub minimal_pkg_add {
 	}
 	elsif ($line =~ /^\@sample (.*)$/) {
 	    $sample_file = $1;
-	    if (!&valid_filepath ($sample_file)) {
+	    if (!valid_filepath ($sample_file)) {
 		die "Aborting due to unusual \@sample file path in $file +CONTENTS. $line\n";
 	    }
 	    # Trailing / is a dir to create, most likely in /etc.
@@ -613,7 +614,7 @@ sub minimal_pkg_add {
 	$substitute_linux || $substitute_macos) {
 	# Set timestamps.
 	foreach $file_extracted (@files_to_extract) {
-	    &set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted});
+	    set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted});
 	}
 	print "Installed package $file.\n";
 	# Extract any perl modules. (This can occur when there are no
@@ -626,9 +627,9 @@ sub minimal_pkg_add {
 		    print "DEBUG: could not extract $substitute_file to $substitute_extract{$substitute_file}. $!\n" if ($debug_flag);
 		}
 		else { # set timestamp, and fix gid for Linux
-		    &set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file}) if ($substitute_linux);
+		    set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file}) if ($substitute_linux);
 		    # already an absolute path for macOS.
-		    &set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file}) if ($substitute_macos)
+		    set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file}) if ($substitute_macos)
 		}
 	    }
 	}
@@ -654,7 +655,7 @@ sub minimal_pkg_add {
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
 		$tar->extract_file ($sample_source_file, $samples_to_extract{$sample_file});
 		# sample files are already an absolute path so no $DIR_PREFIX.
-		&set_timestamp ($samples_to_extract{$sample_file}, $file_ts{$sample_file});
+		set_timestamp ($samples_to_extract{$sample_file}, $file_ts{$sample_file});
 	    }
 	    else {
 		print "DEBUG: not extracting sample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
@@ -669,8 +670,8 @@ sub minimal_pkg_add {
 	}
 	# register package, ignoring errors
 	$tar->extract_file('+CONTENTS', "$PKG_DIR/$file_minus_tgz/+CONTENTS");
-	&update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $LINUX_PERL) if ($substitute_linux);
-	&update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $MACOS_PERL) if ($substitute_macos);
+	update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $LINUX_PERL) if ($substitute_linux);
+	update_package_contents_file ("$PKG_DIR/$file_minus_tgz/+CONTENTS", $OPENBSD_PERL, $MACOS_PERL) if ($substitute_macos);
 	$tar->extract_file('+DESC', "$PKG_DIR/$file_minus_tgz/+DESC");
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
@@ -797,10 +798,10 @@ sub older_package_installed {
 		print "DEBUG: New package has $no_suffix, but current package does not.\n" if ($debug_flag);
 		return 0;
 	    }
-	    if (&version_gt ($current_version, $check_version)) {
+	    if (version_gt ($current_version, $check_version)) {
 		return ($check_file);
 	    }
-	    elsif (&version_gt ($check_version, $current_version)) {
+	    elsif (version_gt ($check_version, $current_version)) {
 		return ("newer:$check_file"); # newer version installed
 	    }
 	}
@@ -963,7 +964,7 @@ sub verify_and_extract_package {
     my ($tar, @fileobjs, $fileobj, $filedir, $filename);
     my (@output, $line);
 
-    if (!&verify_signature ($file)) {
+    if (!verify_signature ($file)) {
 	print "Invalid or missing signature. Could not extract $file.\n";
 	return;
     }
@@ -1007,7 +1008,7 @@ sub verify_signature {
     ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir,
 						 "$SIGNIFY_KEY_NAME.pub",
 						 $SIGNIFY_SEC_KEY);
-    @errors = Signify::signify_error;
+    @errors = Signify::signify_error();
     # All good, signed by specific required key.
     if (!@errors) {
 	return 1;
@@ -1020,7 +1021,7 @@ sub verify_signature {
 	# public key for <domain> or openbsd
 	if ($public_key =~ /^\Q$DOMAINNAME\E-\d+-pkg\.pub$|^openbsd-\d+-pkg\.pub$/) {
 	    ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
-	    @errors = Signify::signify_error;
+	    @errors = Signify::signify_error();
 	    # Didn't verify at all.
 	    if (@errors) {
 		print "@errors";
@@ -1058,8 +1059,8 @@ sub verify_signature {
 sub version_gt {
     my ($version1, $version2) = @_;
     
-    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = &version_parse ($version1);
-    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = &version_parse ($version2);
+    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = version_parse ($version1);
+    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = version_parse ($version2);
 
     return 1 if ($v1_major > $v2_major);
     return 0 if ($v1_major < $v2_major);

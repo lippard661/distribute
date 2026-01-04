@@ -98,6 +98,7 @@
 # Modified 3 January 2026 by Jim Lippard to check for existence of current
 #    year signing key and warn about next year's signing key 30 days in
 #    advance.
+# Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
 
 use strict;
 use Archive::Tar;
@@ -285,7 +286,7 @@ if ($#ARGV == -1) {
 
 # Parse config file.
 print "DEBUG: parsing config file $config_file\n" if ($debug_flag);
-&parse_config ($config_file);
+parse_config ($config_file);
 
 # Validate.
 foreach $arg (@ARGV) {
@@ -414,21 +415,21 @@ foreach $file (@files) {
     # Accumulate syslock groups.
     foreach $host (@process_hosts){
 	print "DEBUG: processing syslock groups for host $host\n" if ($debug_flag);
-	(@{$syslock_groups{$host}}) = &add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
+	(@{$syslock_groups{$host}}) = add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
     }
 
     if ($CONFIG{$file}{TYPE} eq 'package') {
 	# Look for most up-to-date package in $PKG_DIR.
-	$package_path = &find_package ($PKG_DIR, $CONFIG{$file}{FILE});
+	$package_path = find_package ($PKG_DIR, $CONFIG{$file}{FILE});
 	print "DEBUG: processing package $package_path\n" if ($debug_flag);
 	# Verify signature.
-	if (!&verify_signature ($package_path)) {
+	if (!verify_signature ($package_path)) {
 	    die "Invalid or missing signature. $package_path\n";
 	}
 	# Copy package to install directories.
 	# We put these into host_package_path so they get shipped, but
 	# not into host_package_files which get signed.
-	@install_packages = &copy_package ($package_path, @process_hosts);
+	@install_packages = copy_package ($package_path, @process_hosts);
 
 	push (@files_to_ship_and_remove, @install_packages);
 	# It's not dest_file or dest_dir in this case, it's just the
@@ -454,7 +455,7 @@ foreach $file (@files) {
 	    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
 	    foreach $host (@process_hosts) {
 		# Make the fake directory (per-host).
-		&make_fake_dir ($temp_dir, $dest_dir, $host);
+		make_fake_dir ($temp_dir, $dest_dir, $host);
 		# Copy the file into it. Preserve permissions.
 		cp ($CONFIG{$file}{FILE}, "$temp_dir/$host/$dest_path");
 	    }
@@ -481,7 +482,7 @@ foreach $file (@files) {
 	# Each is separate, for now. There may end up being some different
 	# custom types that have common features.
 	if ($file eq 'doas.conf') {
-	    &_custom_doas_dot_conf ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{DEST}, @process_hosts);
+	    _custom_doas_dot_conf ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{DEST}, @process_hosts);
 	    $have_fake_dir = 1;
 	}
 	# Change old IP address to new IP address in a list of files for
@@ -490,7 +491,7 @@ foreach $file (@files) {
 	# /etc, /etc/mail, /home/_rsyncu/.ssh
 	# This does not change /etc/faild.conf for hagbard.
 	elsif ($file eq 'ip-address') {
-	    &_custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
+	    _custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
 	    $have_fake_dir = 1;
 	}
 	else {
@@ -504,42 +505,42 @@ foreach $file (@files) {
 
 # %host_package_files are packages we created that need to be signed.
 if (%host_package_files) {
-    $signify_passphrase = &get_signify_passphrase;
+    $signify_passphrase = get_signify_passphrase();
 }
 
 # If there were any plain or custom files, create and sign the gzips, then copy
 # the packages to the install directory.
 foreach $host (keys (%host_package_files)) {
     print "DEBUG: creating package for plain and custom for host $host\n" if ($debug_flag);
-    $host_package_path{$host} = &create_package ($have_fake_dir, $temp_dir, $date, $host, @{$host_package_files{$host}});
+    $host_package_path{$host} = create_package ($have_fake_dir, $temp_dir, $date, $host, @{$host_package_files{$host}});
     if (!$use_prev_year_key && !Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $SIGNIFY_SEC_KEY, $temp_dir)) {
-	my @errors = Signify::signify_error;
+	my @errors = Signify::signify_error();
 	die "@errors";
     }
     elsif ($use_prev_year_key && !Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $PRIOR_SIGNIFY_SEC_KEY, $temp_dir)) {
-	my @errors = Signify::signify_error;
+	my @errors = Signify::signify_error();
 	die "@errors";
     }
 
-    push (@files_to_ship_and_remove, &copy_package ($host_package_path{$host}, $host));
+    push (@files_to_ship_and_remove, copy_package ($host_package_path{$host}, $host));
 
     # Create syslock group file if any syslock groups are specified.
     if (@{$syslock_groups{$host}}) {
 	print "DEBUG: creating syslock group file for $host\n" if ($debug_flag);
 	print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
-	&create_syslock_group_file ("$host_package_path{$host}.grp", @{$syslock_groups{$host}});
+	create_syslock_group_file ("$host_package_path{$host}.grp", @{$syslock_groups{$host}});
 	# Sign it.
 	if (!$use_prev_year_key && !Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $SIGNIFY_SEC_KEY)) {
-	    @errors = Signify::signify_error;
+	    @errors = Signify::signify_error();
 	    die "Could not sign syslock group file $host_package_path{$host}.grp @errors";
 	}
 	elsif ($use_prev_year_key && !Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $PRIOR_SIGNIFY_SEC_KEY)) {
-	    @errors = Signify::signify_error;
+	    @errors = Signify::signify_error();
 	    die "Could not sign syslock group file $host_package_path{$host}.grp @errors";
 	}   
 	# Add both syslock group file and signature to @files_to_ship_and_remove.
-	push (@files_to_ship_and_remove, &copy_package ("$host_package_path{$host}.grp", $host));
-	push (@files_to_ship_and_remove, &copy_package ("$host_package_path{$host}.grp.sig", $host));
+	push (@files_to_ship_and_remove, copy_package ("$host_package_path{$host}.grp", $host));
+	push (@files_to_ship_and_remove, copy_package ("$host_package_path{$host}.grp.sig", $host));
     }
 }
 
@@ -820,7 +821,7 @@ sub find_package {
 	    if (!defined ($version)) {
 		$version = $check_version;
 	    }
-	    elsif (&version_gt ($check_version, $version)) {
+	    elsif (version_gt ($check_version, $version)) {
 		$version = $check_version;
 	    }
 	}
@@ -834,8 +835,8 @@ sub find_package {
 sub version_gt {
     my ($version1, $version2) = @_;
     
-    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = &version_parse ($version1);
-    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = &version_parse ($version2);
+    my ($v1_major, $v1_minor, $v1_patch, $v1_portrevision, $v1_vv) = version_parse ($version1);
+    my ($v2_major, $v2_minor, $v2_patch, $v2_portrevision, $v2_vv) = version_parse ($version2);
 
     return 1 if ($v1_major > $v2_major);
     return 0 if ($v1_major < $v2_major);
@@ -1023,7 +1024,7 @@ sub _custom_doas_dot_conf {
 
     my %REQ_OPT_CUSTOM_VARS = ('gendoas' => 'required');
 
-    &_custom_validate_custom_vars ('doas.conf', $custom_vars, %REQ_OPT_CUSTOM_VARS);
+    _custom_validate_custom_vars ('doas.conf', $custom_vars, %REQ_OPT_CUSTOM_VARS);
 
     %custom_vars = %{$custom_vars};
 
@@ -1038,7 +1039,7 @@ sub _custom_doas_dot_conf {
     $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
 #    $have_fake_dir = 1; # done after call to this subroutine
     foreach $host (@hosts) {
-	&make_fake_dir ($temp_dir, $dest_dir, $host);
+	make_fake_dir ($temp_dir, $dest_dir, $host);
 	chdir ("$temp_dir/$host$dest_dir");
 	system ($PERL, $GENDOAS, $host);
 	push (@{$host_package_files{$host}}, $dest_path);
@@ -1060,13 +1061,13 @@ sub _custom_ip_address {
 			       'ipv6-name' => 'required',
 			       'dns' => 'required');
 
-    &_custom_validate_custom_vars ('ip-address', $custom_vars, %REQ_OPT_CUSTOM_VARS);
+    _custom_validate_custom_vars ('ip-address', $custom_vars, %REQ_OPT_CUSTOM_VARS);
     
     %custom_vars = %{$custom_vars};
 
     my $CHMOD = '/bin/chmod';
     
-    ($old_address, $new_address) = &_custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});;
+    ($old_address, $new_address) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});;
     @source_paths = split (/,/, $file);
     @dest_paths = split (/,/, $dest);
 #	    $have_fake_dir = 1; done after call to this subroutine
@@ -1094,13 +1095,13 @@ sub _custom_ip_address {
 		}
 
 		# It doesn't hurt to do this if the dir already exists.
-		&make_fake_dir ($temp_dir, $dest_dir, $host);
+		make_fake_dir ($temp_dir, $dest_dir, $host);
 		# Copy the source file to the destination. -p to
 		# preserve permissions. (Doesn't work for pf.conf.)
 		cp ($source_path, "$temp_dir/$host/$dest_path");
 
 		# Update the file by changing the IP addresses.
-		&_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address);
+		_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address);
 
 		# Manually remove g and o read permissions.
 		# This must occur AFTER the call to _custom_global_replace_in_file,
@@ -1159,7 +1160,7 @@ sub _custom_get_old_and_new_ip_addresses {
 	$host_fqdn = $wan1_host_fqdn;
     }
     if (defined ($host_fqdn)) {
-	$old_address = &_get_wan_ip ($host_fqdn);
+	$old_address = _get_wan_ip ($host_fqdn);
     }
     else {
 	$old_address = 'null';
