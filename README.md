@@ -1,11 +1,13 @@
 distribute.pl and install.pl perl scripts to distribute files to multiple hosts and install them.
 install.pl includes minimal functionality to support installing OpenBSD packages (for portable stuff like perl) on non-OpenBSD systems,
 similar to OpenBSD's pkg_add and pkg_delete.
+gendoas.pl generates a per-host doas.conf file from a template file (so that, like with sudo, you can maintain a single config template file for all hosts, with the individual variants distributed via distribute.pl and installed with install.pl).
 pkg_info.pl is a minimal implementation of OpenBSD's pkg_info to go along with that.
 
 Current version of distribute.pl from 4 January 2026.
 Current version of distribute.conf from 14 September 2025.
 Current version of install.pl from 4 January 2026.
+Current version of gendoas.pl from 10 February 2026.
 Current version of pkg_info.pl from 4 January 2026.
 
 Intended primarily for OpenBSD hosts that use immutable file systems, but also works on Linux, I use it with Proxmox (Debian), Kali Linux, and macOS.
