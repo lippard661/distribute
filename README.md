@@ -6,7 +6,7 @@ pkg_info.pl is a minimal implementation of OpenBSD's pkg_info to go along with t
 
 Current version of distribute.pl from 4 January 2026.
 Current version of distribute.conf from 14 September 2025.
-Current version of install.pl from 4 January 2026.
+Current version of install.pl from 25 February 2026.
 Current version of gendoas.pl from 10 February 2026.
 Current version of pkg_info.pl from 4 January 2026.
 
