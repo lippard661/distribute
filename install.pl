@@ -72,10 +72,14 @@
 # Modified 3 January 2026 by Jim Lippard to warn if next year's public
 #    key hasn't shown up yet by two weeks before the new year.
 # Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
+# Modified 25 February 2026 by Jim Lippard using Claude review, to fix
+#    issues in the minimal_pkg_delete functionality and add some security
+#    enhancements.
 
 use strict;
 use Archive::Tar;
 use Cwd;
+use Fcntl ':mode'; # For S_ISREG
 use File::Basename qw(fileparse basename dirname);
 use File::Copy qw(copy);
 use File::Path qw(rmtree make_path);
@@ -639,17 +643,47 @@ sub minimal_pkg_add {
 	foreach $sample_file (keys (%samples_to_extract)) {
 	    if (!-e $samples_to_extract{$sample_file}) {
 		$sample_source_file = $sample_file;
-		
+
 		# Look for custom config if on macOS or Linux.
 		if ($^O eq 'darwin' || $^O eq 'linux') {
-		    my ($sample_dir, $sample_base, $sample_prefix,
-			$sample_check);
+		    my ($sample_dir, $sample_base, $sample_prefix, $sample_check);
+    
+		    # Validate the source file path before manipulating it
+		    if (!valid_filepath ($sample_source_file)) {
+			print "Warning: Invalid sample source file path: $sample_source_file\n";
+			next;  # or appropriate error handling
+		    }
+    
 		    $sample_dir = dirname ($sample_source_file);
 		    $sample_base = basename ($sample_source_file);
+    
+		    # Validate individual components
+		    if ($sample_base =~ /\.\./ || $sample_base =~ /\//) {
+			print "Warning: Invalid basename in sample file: $sample_base\n";
+			next;
+		    }
+    
 		    $sample_prefix = 'macos' if ($^O eq 'darwin');
 		    $sample_prefix = 'linux' if ($^O eq 'linux');
+    
+		    # Construct path safely
 		    $sample_check = $sample_dir . '/' . $sample_prefix . '.' . $sample_base;
-		    $sample_source_file = $sample_check if (grep /^$sample_check$/, @files_to_extract);
+    
+		    # Validate constructed path
+		    if (!valid_filepath ($sample_check)) {
+			print "Warning: Constructed invalid path: $sample_check\n";
+			next;
+		    }
+    
+		    # Use eq instead of regex for matching
+		    my $found = 0;
+		    foreach my $check_file (@files_to_extract) {
+			if ($check_file eq $sample_check) {
+			    $found = 1;
+			    last;
+			}
+		    }
+		    $sample_source_file = $sample_check if ($found);
 		}
 		
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
@@ -694,6 +728,12 @@ sub valid_filepath {
 
     # no directory traversal
     return 0 if ($path =~ /\.\./);
+
+    # reject paths with leading double-slashes or excessive slashes
+    return 0 if ($path =~ /^\/\// || $path =~ /^\/{2,}/);
+
+    # reject paths with null bytes
+    return 0 if ($path =~ /\0/);
 
     # no odd characters (just alphanumeric, underscore, dot, slash, plus, at-sign, tilde, parens, space)
     # this covers all packages I have installed; only one has parens and a space.
@@ -821,18 +861,64 @@ sub minimal_pkg_delete {
 	$ctx, $check_sha);
     my $DIR_PREFIX = '/usr/local';
 
+    # Verify +CONTENTS file exists and is readable
+    if (!-e "$PKG_DIR/$file/+CONTENTS") {
+	print "Package registration not found: $PKG_DIR/$file/+CONTENTS\n";
+	return 0;
+    }
+    
+    if (!-r "$PKG_DIR/$file/+CONTENTS") {
+	print "Cannot read package registration: $PKG_DIR/$file/+CONTENTS\n";
+	return 0;
+    }
+    
+    # Verify it's a regular file
+    my @stat = stat("$PKG_DIR/$file/+CONTENTS");
+    if (!@stat || !S_ISREG($stat[2])) {
+	print "Package registration is not a regular file: $PKG_DIR/$file/+CONTENTS\n";
+	return 0;
+    }
+    
+    # OPTIONAL: Check if +CONTENTS has been modified recently (might indicate tampering)
+    # This is a heuristic - legitimate operations might also modify it
+    my $mtime = $stat[9];
+    my $now = time();
+    if (($now - $mtime) < 60) {  # Modified in last 60 seconds
+	print "Warning: Package registration was recently modified: $PKG_DIR/$file/+CONTENTS\n";
+	print "Proceeding anyway, but this might indicate tampering.\n";
+    }
+
     # Read +CONTENTS, looking for dirs and files to delete and sample files
     # to potentially delete.
     open (FILE, '<', "$PKG_DIR/$file/+CONTENTS");
     while (<FILE>) {
 	chomp;
 	if (!/^[\@\+]/) { # lines not beginning with @ or +
+	    if (!valid_filepath ($_)) {
+		print "Warning: Invalid filepath in +CONTENTS, skipping: $_\n";
+		next;
+	    }
+
+	    # macOS puts perl modules into absolute path.
+	    my $is_macos_perl_absolute = 0;
+	    if ($^O eq 'darwin' && /^\/Library\/Perl\//) {
+		$is_macos_perl_absolute = 1;
+	    }
+	    elsif (substr ($_, 0, 1) eq '/') {
+		print "Warning: Rejecting absolute path in +CONTENTS: $_\n";
+		next;
+	    }
+	    
 	    if (/\/$/) { # lines ending in / are dirs
-		push (@dirs_to_delete, "$DIR_PREFIX/$_");
+		if ($is_macos_perl_absolute) {
+		    push (@dirs_to_delete, $_);
+		}
+		else {
+		    push (@dirs_to_delete, "$DIR_PREFIX/$_");
+		}
 	    }
 	    else { # otherwise it's a file
-		# macOS puts perl modules into absolute path.
-		if ($^O eq 'macos' && substr ($_, 0, 1) eq '/') {
+		if ($is_macos_perl_absolute) {
 		    push (@files_to_delete, $_);
 		}
 		else {
@@ -843,6 +929,12 @@ sub minimal_pkg_delete {
 	# @sample is already a full path.
 	elsif (/^\@sample (.*)$/) {
 	    $sample_file = $1;
+
+	    if (!valid_filepath ($sample_file)) {
+		print "Warning: Invalid sample filepath in +CONTENTS, skipping: $sample_file\n";
+		next;
+	    }
+	    
 	    # Trailing / is a dir to delete, most likely in /etc.
 	    if ($sample_file =~ /\/$/) {
 		push (@dirs_to_delete, $sample_file) unless (!-e $sample_file);
@@ -881,30 +973,92 @@ sub minimal_pkg_delete {
 
 	    # Look for custom config if on macOS or Linux.
 	    if ($^O eq 'darwin' || $^O eq 'linux') {
-		my ($sample_dir, $sample_base, $sample_prefix,
-		    $sample_check);
+		my ($sample_dir, $sample_base, $sample_prefix, $sample_check);
+    
+		# Validate the source file path before manipulating it
+		if (!valid_filepath($sample_source_file)) {
+		    print "Warning: Invalid sample source file path: $sample_source_file\n";
+		    next;  # or appropriate error handling
+		}
+    
 		$sample_dir = dirname ($sample_source_file);
 		$sample_base = basename ($sample_source_file);
+    
+		# Validate individual components
+		if ($sample_base =~ /\.\./ || $sample_base =~ /\//) {
+		    print "Warning: Invalid basename in sample file: $sample_base\n";
+		    next;
+		}
+    
 		$sample_prefix = 'macos' if ($^O eq 'darwin');
 		$sample_prefix = 'linux' if ($^O eq 'linux');
+    
+		# Construct path safely
 		$sample_check = $sample_dir . '/' . $sample_prefix . '.' . $sample_base;
-		$sample_source_file = $sample_check if (grep /^$sample_check$/, @files_to_delete);
+    
+		# Validate constructed path
+		if (!valid_filepath($sample_check)) {
+		    print "Warning: Constructed invalid path: $sample_check\n";
+		    next;
+		}
+    
+		# Use eq instead of regex for matching
+		my $found = 0;
+		foreach my $check_file (@files_to_delete) {
+		    if ($check_file eq $sample_check) {
+			$found = 1;
+			last;
+		    }
+		}
+		$sample_source_file = $sample_check if ($found);
 	    }
 
-	    # check that it's unchanged against size/sha/ts of $sample_source_file
-	    if (-s $samples_to_delete{$sample_file} == $sample_size{$sample_source_file}) {
-		print "DEBUG: size of $samples_to_delete{$sample_file} unchanged from $sample_source_file.\n" if ($debug_flag);
-		if (open (FILE, '<', $samples_to_delete{$sample_file})) {
+	    # SECURITY FIX: check that it's unchanged against size/sha/ts of $sample_source_file
+	    # Use file handle to avoid TOCTOU race condition
+	    if (open (my $fh, '<', $samples_to_delete{$sample_file})) {
+		# Get file stats while file is open
+		my @stat = stat($fh);
+		if (!@stat) {
+		    print "DEBUG: could not stat file $samples_to_delete{$sample_file}. $!\n" if ($debug_flag);
+		    close ($fh);
+		    next;
+		}
+	    
+		# Verify it's a regular file (not symlink, device, etc.)
+		if (!S_ISREG($stat[2])) {
+		    print "DEBUG: $samples_to_delete{$sample_file} is not a regular file, skipping.\n" if ($debug_flag);
+		    close ($fh);
+		    next;
+		}
+	    
+		my $file_size = $stat[7];
+		my $file_inode = $stat[1];
+	    
+		if ($file_size == $sample_size{$sample_source_file}) {
+		    print "DEBUG: size of $samples_to_delete{$sample_file} unchanged from $sample_source_file.\n" if ($debug_flag);
+		
+		    # Compute SHA256 from file handle
 		    $ctx = Digest::SHA->new(256);
-		    $ctx->addfile (*FILE);
-		    close (FILE);
+		    $ctx->addfile($fh);
+		    close ($fh);
+		
 		    $check_sha = $ctx->sha256_base64;
 		    while (length($check_sha) % 4) { # manually add padding
 			$check_sha .= '=';
 		    }
+		
 		    if ($check_sha eq $sample_sha{$sample_source_file}) {
-			print "DEBUG: removing unchanged sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
-			unlink ($samples_to_delete{$sample_file});
+			# Verify file hasn't been replaced between close and unlink
+			my @stat2 = stat($samples_to_delete{$sample_file});
+			if (@stat2 && $stat2[1] == $file_inode && S_ISREG($stat2[2])) {
+			    print "DEBUG: removing unchanged sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
+			    if (!unlink ($samples_to_delete{$sample_file})) {
+				print "DEBUG: could not remove $samples_to_delete{$sample_file}. $!\n" if ($debug_flag);
+			    }
+			}
+			else {
+			    print "DEBUG: file $samples_to_delete{$sample_file} changed between check and delete, not removing.\n" if ($debug_flag);
+			}
 		    }
 		    elsif ($debug_flag) {
 			print "DEBUG: not removing changed (SHA256) sample file $samples_to_delete{$sample_file}.\n";
@@ -912,11 +1066,12 @@ sub minimal_pkg_delete {
 		    }
 		}
 		else {
-		    print "DEBUG: could not open file $samples_to_delete{$sample_file} to check SHA256. $!\n" if ($debug_flag);
+		    close ($fh);
+		    print "DEBUG: not removing changed (size) sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
 		}
 	    }
 	    else {
-		print "DEBUG: not removing changed (size) sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
+		print "DEBUG: could not open file $samples_to_delete{$sample_file} to check. $!\n" if ($debug_flag);
 	    }
 	}
     }
@@ -930,31 +1085,83 @@ sub minimal_pkg_delete {
 	}
     }
 
+    # FIX: delete empty directories in reverse order (deepest first).
+    # Reverse the array so we delete child directories before parents.
+    @dirs_to_delete = reverse(@dirs_to_delete);
+
     # delete empty directories.
     foreach $dir_to_delete (@dirs_to_delete) {
 	# delete if empty, ignore errors unless debug_flag is set.
 	print "DEBUG: removing dir $dir_to_delete.\n" if ($debug_flag);
 	if (!rmdir ($dir_to_delete)) {
-	    print "DEBUG: could not remove dir $dir_to_delete. $!\n" if ($debug_flag);
+	    	# Only print debug message if the error is not "Directory not empty"
+	    # (we expect some dirs to not be empty, that's fine)
+	    if ($debug_flag) {
+		if ($! =~ /Directory not empty/i || $! =~ /ENOTEMPTY/) {
+		    print "DEBUG: dir $dir_to_delete not empty, skipping. $!\n";
+		}
+		else {
+		    print "DEBUG: could not remove dir $dir_to_delete. $!\n";
+		}
+	    }
 	}
     }
 
-    # delete the package registration files and directory.
-    if (!unlink ("$PKG_DIR/$file/+CONTENTS")) {
-	print "Could not remove package registration +CONTENTS. $!\n";
+    # FIX: Verify package directory only contains expected files before cleanup
+    my @expected_files = ('+CONTENTS', '+DESC', '+DISPLAY');
+    my @pkg_files;
+
+    if (opendir(my $pkg_dh, "$PKG_DIR/$file")) {
+	@pkg_files = grep { !/^\.\.?$/ } readdir($pkg_dh);
+	closedir($pkg_dh);
+    
+	# Check for unexpected files
+	my @unexpected;
+	foreach my $pkg_file (@pkg_files) {
+	    push(@unexpected, $pkg_file) unless (grep { $_ eq $pkg_file } @expected_files);
+	}
+    
+	if (@unexpected) {
+	    print "Warning: Unexpected files in package registration directory: @unexpected\n";
+	    print "Package $file may not be fully removed. Manual cleanup of $PKG_DIR/$file may be required.\n";
+	}
     }
-    if (!unlink ("$PKG_DIR/$file/+DESC")) {
-	print "Could not remove package registration +DESC. $!\n";
+
+    # Delete the package registration files
+    my $cleanup_success = 1;
+
+    if (-e "$PKG_DIR/$file/+CONTENTS") {
+	if (!unlink ("$PKG_DIR/$file/+CONTENTS")) {
+	    print "Could not remove package registration +CONTENTS. $!\n";
+	    $cleanup_success = 0;
+	}
     }
-    if (-e "$PKG_DIR/$file/+DISPLAY" && !unlink ("/var/db/pkg/$file/+DISPLAY")) {
-	print "Could not remove package registration +DISPLAY. $!\n";
+
+    if (-e "$PKG_DIR/$file/+DESC") {
+	if (!unlink ("$PKG_DIR/$file/+DESC")) {
+	    print "Could not remove package registration +DESC. $!\n";
+	    $cleanup_success = 0;
+	}
     }
+
+    if (-e "$PKG_DIR/$file/+DISPLAY") {
+	if (!unlink ("$PKG_DIR/$file/+DISPLAY")) {
+	    print "Could not remove package registration +DISPLAY. $!\n";
+	    $cleanup_success = 0;
+	}
+    }
+
+    # Try to remove the directory
     if (!rmdir ("$PKG_DIR/$file")) {
-	print "Could not remove package registration /var/db/pkg/$file. $!\n";
+	print "Could not remove package registration directory $PKG_DIR/$file. $!\n";
 	return 0;
     }
-    
-    print "Deleting package $file.\n";
+
+    if (!$cleanup_success) {
+	print "Warning: Some package registration files could not be removed, but directory cleanup succeeded.\n";
+    }
+
+    print "Deleted package $file.\n";
     return 1;
 }
 
