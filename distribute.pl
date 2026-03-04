@@ -99,6 +99,7 @@
 #    year signing key and warn about next year's signing key 30 days in
 #    advance.
 # Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
+# Modified 4 March 2026 by Jim Lippard to remove tmppath pledge.
 
 use strict;
 use Archive::Tar;
@@ -204,40 +205,6 @@ my %syslock_groups;
 # Signify errors.
 my @errors;
 
-# Maybe my source code should be in a CVS repo on hagbard as the authoritative
-# location?
-# 1. Identify files to distribute. (Command line, config file?)
-#       How to determine where they go? Could be complicated, especially, e.g.,
-#       doas.conf.host. Maybe hard code types, so that command is just
-#       "distribute.pl doas.conf reportnew.conf [other signed packages?]"
-# 2. Package them up. (Signed gzip tar file, package-host-yyyymmddhhmm.tgz,
-#            one per host with the appropriate content for each.)
-#      Could bundle up files to install with appropriate dir structure and
-#       filenames for ultimate location.
-#      For signed packages (sigtree etc.) the packages can just go as-is
-#       and there's not much to be gained by zipping them again.
-#      Source could be in its defined location or not, if not, it needs
-#      to either be in the config or specified (either fake dir structure
-#      in gzip, or specified in an additional file in the gzip).
-#      Need to assemble the list of files, then tar zip them all up.
-# 3. Send them over. (Use rsnapshot method--put them in /var/install.)
-#    rsync --rsync-path=/usr/local/sbin/rsync_wrapper.sh -avr /var/install/host/* host-rsnapshot:/var/install
-#     Note that source can also be /var/install on hagbard to simplify
-#   Could just use existing rsync-tools, but it complicates things
-# Add some kind of PLIST file for /etc/CHANGELOG.
-#
-# Install script:
-# (run via rc.shutdown? but needs to be after securelevel changes)
-# (could be during startup, but will need to add this script to the list
-# of what has to be immutable to avoid security bypasses)
-# 4. Securelevel check.
-# 5. Look for packages.
-# 6. Verify signature. signify -Vz -p /etc/signify/<domain>-<year>-pkg.pub
-# 7. Change flags where necessary for contents (can use sysunlock).
-# 8. Install. maybe verify again: signify -Vz -p /etc/signify/<domain>-<year>-pkg.pub | tar ztf - (use tar to install?) yes.
-# 9. Re-lock.
-# 10. Update CHANGELOG.
-
 ### Main program.
 
 # Get options first.
@@ -328,7 +295,7 @@ if ($^O eq 'openbsd') {
     
     # pledge. stdio already included.
     print "DEBUG: \@custom_pledges = @custom_pledges\n" if ($debug_flag);
-    pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'exec', 'proc', 'fattr', 'unveil', @custom_pledges) || die "Cannot pledge promises. $!\n";
+    pledge ('rpath', 'wpath', 'cpath', 'exec', 'proc', 'fattr', 'unveil', @custom_pledges) || die "Cannot pledge promises. $!\n";
 
     # unveil, need read-only for all source locations, read-write-create
     # for destination locations, and read-execute for all commands used.
@@ -337,20 +304,17 @@ if ($^O eq 'openbsd') {
     foreach $file (@files) {
 	if ($CONFIG{$file}{TYPE} eq 'plain') {
 	    $dir = dirname ($CONFIG{$file}{FILE});
-#	    die "Cannot unveil $dir for plain file $file. $!\n" if (!-d $dir);
 	    unveil ($dir, 'r');
 	}
 	elsif ($CONFIG{$file}{TYPE} eq 'custom') {
 	    my $unveil_file;
 	    if (defined ($CONFIG{$file}{UNVEIL})) {
 		foreach $unveil_file (@{$CONFIG{$file}{UNVEIL}}) {
-#		    die "Cannot unveil $unveil_file from \"unveil:\" for file $file. $!\n" if (!-e $unveil_file);
 		    unveil ($unveil_file, 'r');
 		}
 	    }
 	    if (defined ($CONFIG{$file}{UNVEILEXEC})) {
 		foreach $unveil_file (@{$CONFIG{$file}{UNVEILEXEC}}) {
-#		    die "Cannot unveil $unveil_file from \"unveil-exec:\" for file $file. $!\n" if (!-e $unveil_file);
 		    unveil ($unveil_file, 'rx');
 		}
 	    }
@@ -395,10 +359,6 @@ else {
 foreach $file (@files) {
     @process_hosts = ();
     print "DEBUG: processing file $file\n" if ($debug_flag);
-    # Used to keep 'all' in the config and convert here, now done during
-    # config parsing in order to support 'all except'.
-    # Convert 'all' to the hosts list. Does not include hagbard.
-#    $CONFIG{$file}{HOSTS} = \@HOSTS if ($CONFIG{$file}{HOSTS}[0] eq 'all');
 
     print "DEBUG: \@{\$CONFIG{\$file}{HOSTS}} = @{$CONFIG{$file}{HOSTS}}\n" if ($debug_flag);
     print "DEBUG: \@selected_hosts = @selected_hosts\n" if ($debug_flag && $host_option);
