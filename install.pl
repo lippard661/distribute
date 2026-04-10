@@ -75,6 +75,20 @@
 # Modified 25 February 2026 by Jim Lippard using Claude review, to fix
 #    issues in the minimal_pkg_delete functionality and add some security
 #    enhancements.
+# Modified 9 April 2026 by Jim Lippard to use syslock's audit feature to
+#    check if relevant groups are already unlocked when -f is used and
+#    report if that's the case and the attempted sysunlock fails. There is
+#    an edge case where you might have mixed uchg and schg with a group
+#    used with install, where you previously could install into the uchg
+#    components, which the audit will fail and the install will abort.
+#    The right way to solve this is for install.pl to check specifically
+#    to see if the files and directories where it need to install have
+#    immutable flags set rather than relying on sysunlock -a. If you
+#    encounter this problem you can explicitly reference group:uchg
+#    in your distribute.conf, and only the uchg group will be unlocked
+#    and audited. You can also set up arbitrary new groups for specific
+#    installs, and use different configs in distribute.conf for the same
+#    file installs if they are going into different environments.
 
 use strict;
 use Archive::Tar;
@@ -329,9 +343,13 @@ if ($use_syslock) {
     foreach $syslock_group (@SYSLOCK_GROUPS) {
 	print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
 	system ($SYSUNLOCK, '-g', $syslock_group);
+	my $unlock_exit_code = $? >> 8;
 	if ($force_flag) {
-	    my $exit_code = $? >> 8;
-	    die "sysunlock failed with exit code: $exit_code\n" if ($exit_code != 0);
+	    # Check with audit (requires syslock-1.14 or later).
+	    system ($SYSUNLOCK, '-a', '-q', '-g', $syslock_group);
+	    my $audit_exit_code = $? >> 8;
+	    die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code)\n" if ($audit_exit_code != 0);
+	    print "Note: $syslock_group already unlocked.\n" if ($unlock_exit_code != 0);
 	}
     }
 }
