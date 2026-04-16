@@ -89,6 +89,8 @@
 #    and audited. You can also set up arbitrary new groups for specific
 #    installs, and use different configs in distribute.conf for the same
 #    file installs if they are going into different environments.
+# Modified 16 April 2026 by Claude at the direction of Jim Lippard to
+#    support @mode setting in OpenBSD packages +CONTENTS files.
 
 use strict;
 use Archive::Tar;
@@ -478,8 +480,12 @@ sub minimal_pkg_add {
 	@files_to_extract, @dirs_to_create, $file_extracted, %file_ts,
 	$sample_file, $sample_source_file, %samples_to_extract,
 	$dir, $older_package, %substitute_extract, $substitute_line,
-	$substitute_file, $substitute_linux, $substitute_macos);
+	$substitute_file, $substitute_linux, $substitute_macos,
+	%file_mode, %dir_mode, $current_mode);
     my $DIR_PREFIX = '/usr/local';
+    
+    # Default mode is 0755 (rwxr-xr-x)
+    $current_mode = 0755;
     my $OPENBSD_PERL = 'libdata/perl5/site_perl';
     my $LINUX_PERL = 'lib/site_perl';
     my $PERLV = $^V;
@@ -567,22 +573,27 @@ sub minimal_pkg_add {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
 	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
 		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
+		$dir_mode{$line} = $current_mode;
 	    }
 	    elsif (valid_filepath ($line)) { # otherwise it's a file
 		$last_file = $line;
+		$file_mode{$line} = $current_mode;
 		if ($line =~ /^$OPENBSD_PERL/) {
 		    $substitute_line = $line;
 		    if ($^O eq 'linux') {
 			$substitute_line =~ s/^$OPENBSD_PERL/$LINUX_PERL/;
 			$substitute_linux = 1;
 			push (@dirs_to_create, $LINUX_PERL) if (!-e "$DIR_PREFIX/$LINUX_PERL");
+			$dir_mode{$LINUX_PERL} = $current_mode;
 		    }
 		    elsif ($^O eq 'darwin') {
 			$substitute_line =~ s/^$OPENBSD_PERL/$MACOS_PERL/;
 			$substitute_macos = 1;
 			push (@dirs_to_create, $MACOS_PERL) if (!-e $MACOS_PERL);
+			$dir_mode{$MACOS_PERL} = $current_mode;
 		    }
 		    $substitute_extract{$line} = $substitute_line;
+		    $file_mode{$substitute_line} = $current_mode;
 		}
 		else {
 		    push (@files_to_extract, $line);
@@ -591,6 +602,12 @@ sub minimal_pkg_add {
 	    else {
 		die "Aborting due to unusual line in $file +CONTENTS. $line\n";
 	    }
+	}
+	# mode settings
+	elsif ($line =~ /^\@mode\s+(\S+)$/) {
+	    # Convert octal string to number
+	    $current_mode = oct($1);
+	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
 	}
 	# timestamps
 	elsif ($line =~ /^\@ts (\d+)$/) {
@@ -604,12 +621,14 @@ sub minimal_pkg_add {
 	    # Trailing / is a dir to create, most likely in /etc.
 	    if ($sample_file =~ /\/$/) {
 		push (@dirs_to_create, $sample_file) unless (-e $sample_file);
+		$dir_mode{$sample_file} = $current_mode;
 	    }
 	    # A file to extract into another location if not already present.
 	    # Will typically be last file from @files_to_extract. Key is
 	    # file in tar file, value is full path of destination.
 	    else {
 		$samples_to_extract{$last_file} = $sample_file;
+		$file_mode{$sample_file} = $current_mode;
 	    }
 	}
     }
@@ -628,15 +647,37 @@ sub minimal_pkg_add {
 	elsif ($debug_flag) {
 	    print "DEBUG: created dir $dir (and any missing intermediates)\n";
 	}
+	
+	# Set mode on directory if we have one recorded
+	if (defined($dir_mode{$dir})) {
+	    my $full_path = "$DIR_PREFIX/$dir";
+	    if (!chmod($dir_mode{$dir}, $full_path)) {
+		print "DEBUG: could not set mode " . sprintf("%04o", $dir_mode{$dir}) . " on directory $full_path. $!\n" if ($debug_flag);
+	    }
+	    elsif ($debug_flag) {
+		print "DEBUG: set mode " . sprintf("%04o", $dir_mode{$dir}) . " on directory $full_path\n";
+	    }
+	}
     }
 
     print "DEBUG: extracting package from tar file $file\n" if ($debug_flag);
     print "DEBUG: \@files_to_extract = @files_to_extract\n" if ($debug_flag);
     if ((@files_to_extract && $tar->extract (@files_to_extract)) ||
 	$substitute_linux || $substitute_macos) {
-	# Set timestamps.
+	# Set timestamps and modes.
 	foreach $file_extracted (@files_to_extract) {
 	    set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted});
+	    
+	    # Set mode on file if we have one recorded
+	    if (defined($file_mode{$file_extracted})) {
+		my $full_path = "$DIR_PREFIX/$file_extracted";
+		if (!chmod($file_mode{$file_extracted}, $full_path)) {
+		    print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$file_extracted}) . " on file $full_path. $!\n" if ($debug_flag);
+		}
+		elsif ($debug_flag) {
+		    print "DEBUG: set mode " . sprintf("%04o", $file_mode{$file_extracted}) . " on file $full_path\n";
+		}
+	    }
 	}
 	print "Installed package $file.\n";
 	# Extract any perl modules. (This can occur when there are no
@@ -648,10 +689,34 @@ sub minimal_pkg_add {
 		if (!$tar->extract_file ($substitute_file, $substitute_extract{$substitute_file})) {
 		    print "DEBUG: could not extract $substitute_file to $substitute_extract{$substitute_file}. $!\n" if ($debug_flag);
 		}
-		else { # set timestamp, and fix gid for Linux
-		    set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file}) if ($substitute_linux);
-		    # already an absolute path for macOS.
-		    set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file}) if ($substitute_macos)
+		else { # set timestamp, fix gid for Linux, and set mode
+		    if ($substitute_linux) {
+			set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file});
+			# Set mode on substituted file
+			if (defined($file_mode{$substitute_line})) {
+			    my $full_path = "$DIR_PREFIX/$substitute_extract{$substitute_file}";
+			    if (!chmod($file_mode{$substitute_line}, $full_path)) {
+				print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path. $!\n" if ($debug_flag);
+			    }
+			    elsif ($debug_flag) {
+				print "DEBUG: set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path\n";
+			    }
+			}
+		    }
+		    if ($substitute_macos) {
+			# already an absolute path for macOS.
+			set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file});
+			# Set mode on substituted file
+			if (defined($file_mode{$substitute_line})) {
+			    my $full_path = $substitute_extract{$substitute_file};
+			    if (!chmod($file_mode{$substitute_line}, $full_path)) {
+				print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path. $!\n" if ($debug_flag);
+			    }
+			    elsif ($debug_flag) {
+				print "DEBUG: set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path\n";
+			    }
+			}
+		    }
 		}
 	    }
 	}
@@ -708,6 +773,17 @@ sub minimal_pkg_add {
 		$tar->extract_file ($sample_source_file, $samples_to_extract{$sample_file});
 		# sample files are already an absolute path so no $DIR_PREFIX.
 		set_timestamp ($samples_to_extract{$sample_file}, $file_ts{$sample_file});
+		
+		# Set mode on sample file
+		if (defined($file_mode{$samples_to_extract{$sample_file}})) {
+		    my $full_path = $samples_to_extract{$sample_file};
+		    if (!chmod($file_mode{$samples_to_extract{$sample_file}}, $full_path)) {
+			print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$sample_file}}) . " on sample file $full_path. $!\n" if ($debug_flag);
+		    }
+		    elsif ($debug_flag) {
+			print "DEBUG: set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$sample_file}}) . " on sample file $full_path\n";
+		    }
+		}
 	    }
 	    else {
 		print "DEBUG: not extracting sample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
