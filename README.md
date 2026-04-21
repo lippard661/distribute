@@ -398,13 +398,13 @@ install distribute and all other packages on OpenBSD, Linux, and macOS.
 ```sh
 # distribute.pl — on the central distribution server (OpenBSD)
 cp src/distribute.pl /usr/local/sbin/distribute.pl
-chmod 700 /usr/local/sbin/distribute.pl   # root only
+chmod 755 /usr/local/sbin/distribute.pl
 cp etc/distribute.conf /etc/distribute.conf
 chmod 600 /etc/distribute.conf
 
 # install.pl — on each managed host
 cp src/install.pl /usr/local/sbin/install.pl
-chmod 700 /usr/local/sbin/install.pl      # root only
+chmod 755 /usr/local/sbin/install.pl
 
 # gendoas.pl — on the distribution server
 cp src/gendoas.pl /usr/local/bin/gendoas.pl
@@ -448,7 +448,8 @@ mkdir -p /var/installation   # macOS
 
 - `/etc/distribute.conf` should be mode 0600 (root only); it reveals
   your host topology, sync relationships, and file locations
-- distribute.pl and install.pl should be mode 0700 (root only)
+- distribute.pl and install.pl are mode 0755; both require and verify
+  that they are run as root
 - The signing key secret file should be 0600 and its passphrase stored
   securely off the distribution server (see Key Security above)
 - install.pl verifies signatures twice for OpenBSD packages installed
