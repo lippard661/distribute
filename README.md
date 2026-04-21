@@ -12,9 +12,16 @@ distribute.pl runs on OpenBSD only (uses OpenBSD ports packages as source).
 
 Also included in this repo:
 - **gendoas.pl** — generates per-host doas.conf files from a shared template
+  (included in the distribute package)
 - **pkg_info.pl** — minimal pkg_info equivalent for Linux and macOS
+  (included in the install package)
 
-No signed OpenBSD package is available yet; installation is currently manual.
+The OpenBSD packages are signed with signify. To verify:
+```
+signify -C -p discord.org-2026-pkg.pub -x install-1.0.tgz
+signify -C -p discord.org-2026-pkg.pub -x distribute-1.0.tgz
+```
+Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
 ## Overview
 
@@ -366,7 +373,27 @@ configuration and flag management.
 
 ## Installation
 
-No signed package is available yet. Manual installation:
+### Recommended: OpenBSD signed packages
+
+Two packages are provided:
+
+**install** (install.pl + pkg_info.pl):
+```
+pkg_add ./install-1.0.tgz                    # OpenBSD
+```
+Or using install.pl on OpenBSD, Linux, or macOS once it is itself installed.
+
+**distribute** (distribute.pl + gendoas.pl):
+```
+pkg_add ./distribute-1.0.tgz                 # OpenBSD
+```
+The default distribute.conf included with the package references the
+installed path for gendoas.pl automatically.
+
+install.pl is the bootstrap tool — install it first, then use it to
+install distribute and all other packages on OpenBSD, Linux, and macOS.
+
+### Manual installation
 
 ```sh
 # distribute.pl — on the central distribution server (OpenBSD)
