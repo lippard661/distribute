@@ -33,7 +33,7 @@ my (%options, $output_file, $another_host, $hostname, $user, $date, $temp_dir, $
 getopts ('Vo:', \%options) || exit;
 
 if ($options{'V'}) {
-    print 'gendoas.pl version 1.2 of 20 April 2026\n';
+    print "gendoas.pl version 1.2 of 20 April 2026\n";
     exit;
 }
 
