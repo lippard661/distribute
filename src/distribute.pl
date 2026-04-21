@@ -100,6 +100,8 @@
 #    advance.
 # Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
 # Modified 4 March 2026 by Jim Lippard to remove tmppath pledge.
+# Modified 20 April 2026 by Jim Lippard to fix version comparison typo
+#    and remove dead code sign_package (now done by Signify).
 
 use strict;
 use Archive::Tar;
@@ -803,7 +805,7 @@ sub version_gt {
     return 1 if ($v1_minor > $v2_minor);
     return 0 if ($v1_minor < $v2_minor);
     return 1 if ($v1_patch > $v2_patch);
-    return 0 if ($v2_patch < $v2_patch);
+    return 0 if ($v1_patch < $v2_patch);
     return 1 if ($v1_vv gt $v2_vv);
     return 0 if ($v1_vv lt $v2_vv);
     return 1 if ($v1_portrevision gt $v2_portrevision);
@@ -877,26 +879,6 @@ sub get_signify_passphrase {
     system ($STTY, 'echo');
     chomp ($signify_passphrase);
     return ($signify_passphrase);
-}
-
-# Subroutine to sign a gzip file.
-sub sign_package {
-    my ($signify_passphrase, $temp_dir, $gzip) = @_;
-
-    if (!-r $gzip) {
-	die "Could not read $gzip to sign. $!\n";
-    }
-
-    # Sign the package.
-    open (SIGNIFYPIPE, '|-', "$SIGNIFY -Sz -s $SIGNIFY_SEC_KEY -m $gzip -x $temp_dir/out.tgz") || die "Unable to sign package. $!\n";
-    print SIGNIFYPIPE "$signify_passphrase\n";
-    close (SIGNIFYPIPE);
-
-    # Copy signed gzip over original.
-    copy ("$temp_dir/out.tgz", $gzip);
-    
-    # Remove extraneous file.
-    unlink ("$temp_dir/out.tgz");
 }
 
 # Subroutine to copy package to appropriate install dirs.

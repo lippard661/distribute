@@ -5,6 +5,7 @@
 # Written 12 August 2019 by Jim Lippard
 # Modified 10 February 2026 by Jim Lippard to use perl modules for temp file,
 #    do some minor cleanup, add pledge/unveil, add -o and -V options.
+# Modified 20 April 2026 by Jim Lippard to fix -V output.
 
 use strict;
 use warnings;
@@ -32,7 +33,7 @@ my (%options, $output_file, $another_host, $hostname, $user, $date, $temp_dir, $
 getopts ('Vo:', \%options) || exit;
 
 if ($options{'V'}) {
-    print 'getopts.pl version 1.1 of 10 February 2026\n';
+    print 'gendoas.pl version 1.2 of 20 April 2026\n';
     exit;
 }
 

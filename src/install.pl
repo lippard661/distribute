@@ -91,6 +91,7 @@
 #    file installs if they are going into different environments.
 # Modified 16 April 2026 by Claude at the direction of Jim Lippard to
 #    support @mode setting in OpenBSD packages +CONTENTS files.
+# Modified 20 April 2026 by Jim Lippard to fix version comparison typo.
 
 use strict;
 use Archive::Tar;
@@ -171,7 +172,7 @@ if ($^O eq 'openbsd') {
     $current_openbsd--;
 }
 else {
-    my $current_openbsd = 'not-openbsd';
+    $current_openbsd = 'not-openbsd';
 }
 my $OPENBSD_MIN_VERSION = "$current_openbsd";
 
@@ -1368,7 +1369,7 @@ sub version_gt {
     return 1 if ($v1_minor > $v2_minor);
     return 0 if ($v1_minor < $v2_minor);
     return 1 if ($v1_patch > $v2_patch);
-    return 0 if ($v2_patch < $v2_patch);
+    return 0 if ($v1_patch < $v2_patch);
     return 1 if ($v1_vv gt $v2_vv);
     return 0 if ($v1_vv lt $v2_vv);
     return 1 if ($v1_portrevision gt $v2_portrevision);
