@@ -102,6 +102,13 @@
 # Modified 4 March 2026 by Jim Lippard to remove tmppath pledge.
 # Modified 20 April 2026 by Jim Lippard to fix version comparison typo
 #    and remove dead code sign_package (now done by Signify).
+# Modified 21 April 2026 by Jim Lippard to add -k (key) option and config
+#    file options for pkg-dir and default-signing-key. If a non-standard
+#    format key is used for plain or custom files, the user will be warned
+#    and prompted to continue. Packages can be signed by any <domain>-<year>-pkg
+#    key for which the public key is in /etc/signify (this script doesn't
+#    sign packages but expects them to be signify-signed, e.g., with OpenBSD's
+#    pkg_sign or manually with signify).
 
 use strict;
 use Archive::Tar;
@@ -117,6 +124,8 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
+
+my $VERSION = 'distribute.pl version 1.0 of 21 April 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -201,6 +210,9 @@ my ($arg, @args, $file, @files, @process_hosts, $package_path,
     $signify_passphrase, @files_to_ship_and_remove, @rsync_file_list,
     @install_packages);
 
+# Signing key variables (set after config parsing and option processing)
+my ($signing_sec_key, $signing_pub_key, $signing_key_name);
+
 # Hash of arrays, one per host.
 my %syslock_groups;
 
@@ -210,7 +222,13 @@ my @errors;
 ### Main program.
 
 # Get options first.
-getopts ('46pdc:h:', \%opts) || exit;
+getopts ('46pdVc:h:k:', \%opts) || exit;
+
+# -V version
+if ($opts{'V'}) {
+    print "$VERSION\n";
+    exit 0;
+}
 
 # -4 default and doesn't really do anything.
 if ($opts{'4'} && $opts{'6'}) {
@@ -228,6 +246,14 @@ else {
 
 if ($opts{'p'}) {
     $use_prev_year_key = 1;
+}
+
+# -k custom key option
+my $custom_key_option = $opts{'k'};
+
+# -k and -p are mutually exclusive
+if ($custom_key_option && $use_prev_year_key) {
+    die "-k (custom key) and -p (prior year key) are mutually exclusive.\n";
 }
 
 $config_file = $opts{'c'} || $CONFIG_FILE;
@@ -250,12 +276,86 @@ else {
 $debug_flag = $opts{'d'};
 
 if ($#ARGV == -1) {
-    die "Usage: distribute.pl [-4|-6|-p (prior year key)|-c config|-h hosts(CSV)|-d debug] [files]\n";
+    die "Usage: distribute.pl [-4|-6|-p (prior year key)|-V (version)|-c config|-h hosts(CSV)|-k key|-d debug] [files]\n";
 }
 
 # Parse config file.
 print "DEBUG: parsing config file $config_file\n" if ($debug_flag);
 parse_config ($config_file);
+
+# Override PKG_DIR if specified in config
+if (defined($CONFIG{_GLOBAL}{PKG_DIR})) {
+    $PKG_DIR = $CONFIG{_GLOBAL}{PKG_DIR};
+    print "DEBUG: Using PKG_DIR from config: $PKG_DIR\n" if ($debug_flag);
+}
+
+# Select signing key for plain/custom files
+if ($custom_key_option) {
+    $signing_key_name = $custom_key_option;
+    $signing_key_name .= '.sec' unless ($signing_key_name =~ /\.sec$/);
+    $signing_sec_key = "$SIGNIFY_PUB_KEY_DIR/$signing_key_name";
+    $signing_pub_key = $signing_sec_key;
+    $signing_pub_key =~ s/\.sec$/.pub/;
+    
+    die "Custom signing key not found: $signing_sec_key\n" unless (-e $signing_sec_key);
+    die "Custom public key not found: $signing_pub_key\n" unless (-e $signing_pub_key);
+    
+    ($signing_key_name) = basename($signing_sec_key) =~ /^(.*)\.sec$/;
+    print "DEBUG: Using custom signing key: $signing_key_name\n" if ($debug_flag);
+}
+elsif ($use_prev_year_key) {
+    # -p option: use prior year key
+    $signing_sec_key = $PRIOR_SIGNIFY_SEC_KEY;
+    $signing_pub_key = $PRIOR_SIGNIFY_PUB_KEY;
+    $signing_key_name = $PRIOR_SIGNIFY_KEY_NAME;
+    
+    print "DEBUG: Using prior year signing key: $signing_key_name\n" if ($debug_flag);
+}
+elsif (defined($CONFIG{_GLOBAL}{DEFAULT_SIGNING_KEY})) {
+    $signing_key_name = $CONFIG{_GLOBAL}{DEFAULT_SIGNING_KEY};
+    $signing_key_name .= '.sec' unless ($signing_key_name =~ /\.sec$/);
+    $signing_sec_key = "$SIGNIFY_PUB_KEY_DIR/$signing_key_name";
+    $signing_pub_key = $signing_sec_key;
+    $signing_pub_key =~ s/\.sec$/.pub/;
+    ($signing_key_name) = basename($signing_sec_key) =~ /^(.*)\.sec$/;
+    print "DEBUG: Using default signing key from config: $signing_key_name\n" if ($debug_flag);
+}
+else {
+    # Default: use current year key based on domain
+    $signing_sec_key = $SIGNIFY_SEC_KEY;
+    $signing_pub_key = $SIGNIFY_PUB_KEY;
+    $signing_key_name = $SIGNIFY_KEY_NAME;
+    
+    print "DEBUG: Using default signing key: $signing_key_name\n" if ($debug_flag);
+}
+
+# Validate selected signing key exists
+if (!-e $signing_sec_key) {
+    die "Signing key $signing_sec_key does not exist.\n";
+}
+if (!-e $signing_pub_key) {
+    die "Public key $signing_pub_key does not exist.\n";
+}
+
+# Validate readability of signing key.
+if (!-r $signing_sec_key) {
+    die "Signing key $signing_sec_key is not readable.\n";
+}
+
+# Warn if signing key doesn't follow domain-year-pkg pattern
+if ($signing_key_name !~ /^\Q$DOMAINNAME\E-\d+-pkg$/) {
+    print "\n";
+    print "Warning: Signing key '$signing_key_name' doesn't follow the standard pattern.\n";
+    print "Expected pattern: $DOMAINNAME-YEAR-pkg (e.g., $DOMAINNAME-2026-pkg)\n";
+    print "\n";
+    print "Plain/custom files signed with this key will require explicit user\n";
+    print "acceptance during installation on target systems.\n";
+    print "\n";
+    if (!yes_or_no("Continue with non-standard signing key? [y/n]: ")) {
+        die "Aborted: non-standard signing key rejected.\n";
+    }
+    print "\n";
+}
 
 # Validate.
 foreach $arg (@ARGV) {
@@ -278,14 +378,7 @@ if ($opts{'h'}) {
 $date = strftime ("%Y%m%d-%H%M%s", localtime (time()));
 print "DEBUG: getting date: $date\n" if ($debug_flag);
 
-# Abort if current year signing key is missing and not using prior year key.
-# Warn about missing current year signing key (abort unless using prior year
-# key) and missing next year signing key if month is December.
-if (!-e $SIGNIFY_SEC_KEY) {
-    die "Current year signing key $SIGNIFY_SEC_KEY does not exist.\n" unless ($use_prev_year_key);
-    print "Warning: Current year signing key $SIGNIFY_SEC_KEY does not exist.\n";
-}
-# Check next year's public key existence.
+# Warn about missing next year signing key if month is December.
 if (!-e $SIGNIFY_PUB_KEY_NEXT && $date =~ /^..12/) {
     print "Warning: Next year's signing key and public key $SIGNIFY_PUB_KEY_NEXT do not exist.\n";
 }
@@ -385,7 +478,7 @@ foreach $file (@files) {
 	$package_path = find_package ($PKG_DIR, $CONFIG{$file}{FILE});
 	print "DEBUG: processing package $package_path\n" if ($debug_flag);
 	# Verify signature.
-	if (!verify_signature ($package_path)) {
+	if (!verify_signature ($package_path, 1)) { # 1 = is_package
 	    die "Invalid or missing signature. $package_path\n";
 	}
 	# Copy package to install directories.
@@ -475,13 +568,9 @@ if (%host_package_files) {
 foreach $host (keys (%host_package_files)) {
     print "DEBUG: creating package for plain and custom for host $host\n" if ($debug_flag);
     $host_package_path{$host} = create_package ($have_fake_dir, $temp_dir, $date, $host, @{$host_package_files{$host}});
-    if (!$use_prev_year_key && !Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $SIGNIFY_SEC_KEY, $temp_dir)) {
+    if (!Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $signing_sec_key, $temp_dir)) {
 	my @errors = Signify::signify_error();
-	die "@errors";
-    }
-    elsif ($use_prev_year_key && !Signify::sign_gzip ($host_package_path{$host}, $signify_passphrase, $PRIOR_SIGNIFY_SEC_KEY, $temp_dir)) {
-	my @errors = Signify::signify_error();
-	die "@errors";
+	die "Could not sign package with $signing_key_name: @errors\n";
     }
 
     push (@files_to_ship_and_remove, copy_package ($host_package_path{$host}, $host));
@@ -492,13 +581,9 @@ foreach $host (keys (%host_package_files)) {
 	print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
 	create_syslock_group_file ("$host_package_path{$host}.grp", @{$syslock_groups{$host}});
 	# Sign it.
-	if (!$use_prev_year_key && !Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $SIGNIFY_SEC_KEY)) {
+	if (!Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $signing_sec_key)) {
 	    @errors = Signify::signify_error();
-	    die "Could not sign syslock group file $host_package_path{$host}.grp @errors";
-	}
-	elsif ($use_prev_year_key && !Signify::sign ("$host_package_path{$host}.grp", $signify_passphrase, $PRIOR_SIGNIFY_SEC_KEY)) {
-	    @errors = Signify::signify_error();
-	    die "Could not sign syslock group file $host_package_path{$host}.grp @errors";
+	    die "Could not sign syslock group file $host_package_path{$host}.grp with $signing_key_name: @errors\n";
 	}   
 	# Add both syslock group file and signature to @files_to_ship_and_remove.
 	push (@files_to_ship_and_remove, copy_package ("$host_package_path{$host}.grp", $host));
@@ -606,6 +691,28 @@ sub parse_config {
 		die "A \"syslock-groups-list:\" field in file context on lin $line_no. $_\n" if ($context == $FILE_CONTEXT);
 		die "A second \"syslock-groups-list:\" field on line $line_no. $_\n" if (@syslock_groups_list);
 		@syslock_groups_list = split (/,\s*/, $value);
+	    }
+	    elsif ($field eq 'default-signing-key') {
+		die "A \"default-signing-key:\" field in file context on line $line_no. $_\n" if ($context == $FILE_CONTEXT);
+		die "A second \"default-signing-key:\" field on line $line_no. $_\n" if (defined($CONFIG{_GLOBAL}{DEFAULT_SIGNING_KEY}));
+		
+		# Expand variables
+		$value =~ s/\$DOMAINNAME/$DOMAINNAME/g;
+		$value =~ s/\$YEAR/$year/g;
+
+		# Check for standard format.
+		if ($value !~ /^[\w\.\-]+-\d+-pkg$/) {
+		    print "Warning: default-signing-key '$value' doesn't follow standard pattern (domain-year-pkg)\n";
+		    print "This key will require user prompting during installation.\n";
+		}
+		
+		$CONFIG{_GLOBAL}{DEFAULT_SIGNING_KEY} = $value;
+	    }
+	    elsif ($field eq 'pkg-dir') {
+		die "A \"pkg-dir:\" field in file context on line $line_no. $_\n" if ($context == $FILE_CONTEXT);
+		die "A second \"pkg-dir:\" field on line $line_no. $_\n" if (defined($CONFIG{_GLOBAL}{PKG_DIR}));
+		
+		$CONFIG{_GLOBAL}{PKG_DIR} = $value;
 	    }
 	    elsif ($field eq 'name') {
 		if ($context == $GLOBAL_CONTEXT) {
@@ -1202,60 +1309,135 @@ sub create_syslock_group_file {
     close (FILE);
 }
 
+### Following subroutines are present in both distribute.pl and install.pl
+### and should be kept consistent.
+
+## This subroutine is borrowed from sigtree.pl.
+# Ask a yes or no question.
+sub yes_or_no {
+    my ($query) = @_;
+    my ($answer);
+
+    while (1) {
+        print "$query";
+        $answer = <STDIN>;
+        chomp ($answer);
+
+        if ($answer eq 'yes' || $answer eq 'y') {
+            return 1;
+        }
+        elsif ($answer eq 'no' || $answer eq 'n') {
+            return 0;
+        }
+        else {
+            print "Please answer \"yes\" or \"no\".\n";
+        }
+    }
+}
+
 # Subroutine used in both distribute.pl and install.pl, be sure to keep
 # consistent.
 # Now uses Signify.pm to do most of the work.
 sub verify_signature {
-    my ($gzip_path) = @_;
+    my ($gzip_path, $is_package) = @_;
     my ($signer, $signdate, @errors);
     my ($public_key, $signer_key_file, $signer_key_dir);
     my ($key_type, $num);
+    
+    print "DEBUG: Verifying " . ($is_package ? "package" : "plain/custom") . ": $gzip_path\n" if ($debug_flag);
 
-    # First, try with specific key.
     ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir,
 						 "$SIGNIFY_KEY_NAME.pub",
 						 $SIGNIFY_SEC_KEY);
     @errors = Signify::signify_error;
-    # All good, signed by specific required key.
+    
     if (!@errors) {
+	print "DEBUG: Verified with expected key: $SIGNIFY_KEY_NAME.sec\n" if ($debug_flag);
 	return 1;
     }
-    # Check for optional keys.
-    # if pubkey is <domain>-(\d+)-pkg.pub and >= SIGNIFY_MIN_YEAR, it's
-    # ok.  if it's openbsd-(\d+)-pkg.pub and >= OPENBSD_MIN_VERSION, it's ok
+    
     elsif ($errors[0] =~ /public key is \"(.*)\" but/) {
 	$public_key = $1;
-	# public key for <domain> or openbsd
-	if ($public_key =~ /^\Q$DOMAINNAME\E-\d+-pkg\.pub$|^openbsd-\d+-pkg\.pub$/) {
-	    ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
-	    @errors = Signify::signify_error;
-	    # Didn't verify at all.
-	    if (@errors) {
-		print "@errors";
-		return 0;
-	    }
-	    ($signer_key_file, $signer_key_dir) = fileparse ($signer);
-	    if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
-		print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
-		return 0;
-	    }
-	    # secret key for <domain> or openbsd
-	    if ($signer_key_file =~ /^(\Q$DOMAINNAME\E)-(\d+)-pkg\.sec$|^(openbsd)-(\d+)-pkg\.sec$/) { 
+	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
+	@errors = Signify::signify_error;
+	
+	if (@errors) {
+	    print "@errors";
+	    return 0;
+	}
+	
+	($signer_key_file, $signer_key_dir) = fileparse ($signer);
+	if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
+	    print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
+	    return 0;
+	}
+	
+	if ($is_package) {
+	    if ($signer_key_file =~ /^([\w\.\-]+)-(\d+)-pkg\.sec$/) {
 		$key_type = $1;
 		$num = $2;
-		# Gotta meet minimum version requirements.
-		if (($key_type eq $DOMAINNAME && $num >= $SIGNIFY_MIN_YEAR) ||
-		    ($^O eq 'openbsd' && $key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
-		    return 1; # all good
+		if ($num >= $SIGNIFY_MIN_YEAR) {
+		    print "DEBUG: Package signed with valid key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
 		}
-		# Didn't meet minimum version requirements
 		else {
-		    print "Not signed by required key version, signed by $signer.\n";
+		    print "Package key $signer_key_file does not meet minimum year $SIGNIFY_MIN_YEAR.\n";
 		    return 0;
 		}
-	    } # not secret key for <domain> or openbsd
-	} # not public key for <domain> or openbsd
+	    }
+	    elsif ($^O eq 'openbsd' && $signer_key_file =~ /^(openbsd)-(\d+)-pkg\.sec$/) {
+		$key_type = $1;
+		$num = $2;
+		if ($num >= $OPENBSD_MIN_VERSION) {
+		    print "DEBUG: Package signed with OpenBSD key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
+		}
+		else {
+		    print "OpenBSD key $signer_key_file does not meet minimum version.\n";
+		    return 0;
+		}
+	    }
+	    else {
+		print "Package signed with unrecognized key pattern: $signer_key_file\n";
+		return 0;
+	    }
+	}
+	else {
+	    if ($signer_key_file =~ /^(\Q$DOMAINNAME\E)-(\d+)-pkg\.sec$/) {
+		$key_type = $1;
+		$num = $2;
+		if ($num >= $SIGNIFY_MIN_YEAR) {
+		    print "DEBUG: Plain/custom signed with own domain key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
+		}
+		else {
+		    print "Domain key $signer_key_file does not meet minimum year.\n";
+		    return 0;
+		}
+	    }
+	    # Plain/custom with non-domain key
+	    else {
+		# For any other key, check if we should accept it
+		# In install.pl this prompts, in distribute.pl this rejects
+		if (can_accept_alternate_plain_key($signer_key_file)) {
+		    print "Accepted alternate signing key.\n";
+		    return 1;
+		}
+		else {
+		    print "Rejected alternate signing key.\n";
+		    return 0;
+		}
+	    }
+	}
     }
+    
     print "@errors";
+    return 0;
+}
+
+# This differs in install.pl.
+sub can_accept_alternate_plain_key {
+    my ($key_file) = @_;
+    print "Plain/custom signed with non-domain key: $key_file (rejected)\n";
     return 0;
 }

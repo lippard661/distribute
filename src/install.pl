@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 # Script to install signed packages created and distributed by distribute.pl.
+#
 # Written 3, 5 February 2022 by Jim Lippard.
 # Modified 5 February 2023 by Jim Lippard to verify OpenBSD-signed
 #    packages against listed public keys, not just verify the name.
@@ -92,6 +93,10 @@
 # Modified 16 April 2026 by Claude at the direction of Jim Lippard to
 #    support @mode setting in OpenBSD packages +CONTENTS files.
 # Modified 20 April 2026 by Jim Lippard to fix version comparison typo.
+# Modified 21 April 2026 by Jim Lippard to prompt for plain/custom files
+#    signed with a key other than the <domain>-<year>-pkg format, but
+#    to allow packages to be signed by any source for which there is
+#    a public key in /etc/signify.
 
 use strict;
 use Archive::Tar;
@@ -115,6 +120,8 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 }
 
 ### Constants.
+
+my $VERSION = 'install.pl version 1.0 of 21 April 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -204,7 +211,13 @@ my $debug_flag = 0;
 # 10. Update CHANGELOG.
 
 # Check options.
-getopts ('fnd', \%opts) || exit;
+getopts ('fndV', \%opts) || exit;
+
+# -V version
+if ($opts{'V'}) {
+    print "$VERSION\n";
+    exit 0;
+}
 
 $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
@@ -213,7 +226,7 @@ $debug_flag = $opts{'d'};
 die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag && !$use_syslock);
 
 if ($#ARGV != -1) {
-    die "Usage: install.pl [-f (force)|-n (no syslock)|-d debug]\n";
+    die "Usage: install.pl [-f (force)|-n (no syslock)|-V (version)|-d debug]\n";
 }
 
 # Get user.
@@ -446,7 +459,7 @@ close (FILE);
 sub install_pkg_add {
     my ($file) = @_;
 
-    if (!verify_signature ($file)) {
+    if (!verify_signature ($file, 1)) { # 1 = is_package
 	print "Invalid or missing signature. Could not install package $file.\n";
 	return;
     }
@@ -501,7 +514,7 @@ sub minimal_pkg_add {
     }
     
     # Do another signify verification post-tar-read to mitigate TOCTOU race.
-    if (!verify_signature ($file)) {
+    if (!verify_signature ($file, 1)) { # 1 = is_package
 	print "Invalid or missing signature. Could not install package $file.\n";
 	return;
     }
@@ -1266,7 +1279,7 @@ sub verify_and_extract_package {
     my ($tar, @fileobjs, $fileobj, $filedir, $filename);
     my (@output, $line);
 
-    if (!verify_signature ($file)) {
+    if (!verify_signature ($file, 0)) { # 0 = plain/custom
 	print "Invalid or missing signature. Could not extract $file.\n";
 	return;
     }
@@ -1294,65 +1307,154 @@ sub verify_and_extract_package {
     return (@output);
 }
 
-### Following subroutines are taken from distribute.pl and should be kept
-### consistent.
+# Prompt user to accept an alternate signing key.
+sub should_accept_alternate_key {
+    my ($found_key, $expected_key) = @_;
+    
+    print "\n";
+    print "=" x 70 . "\n";
+    print "SIGNATURE VERIFICATION WARNING\n";
+    print "=" x 70 . "\n";
+    print "File is signed with:  $found_key\n";
+    print "Expected signing key: $expected_key\n";
+    print "\n";
+    print "The signing key is valid and in $SIGNIFY_PUB_KEY_DIR,\n";
+    print "but it is not the expected key for this system.\n";
+    print "\n";
+    
+    return yes_or_no("Accept this key and install the file? [y/n]: ");
+}
+
+### Following subroutines are present in both distribute.pl and install.pl
+### and should be kept consistent.
+
+## This subroutine is borrowed from sigtree.pl.
+# Ask a yes or no question.
+sub yes_or_no {
+    my ($query) = @_;
+    my ($answer);
+
+    while (1) {
+        print "$query";
+        $answer = <STDIN>;
+        chomp ($answer);
+
+        if ($answer eq 'yes' || $answer eq 'y') {
+            return 1;
+        }
+        elsif ($answer eq 'no' || $answer eq 'n') {
+            return 0;
+        }
+        else {
+            print "Please answer \"yes\" or \"no\".\n";
+        }
+    }
+}
 
 # Subroutine used in both distribute.pl and install.pl, be sure to keep
 # consistent.
 # Now uses Signify.pm to do most of the work.
 sub verify_signature {
-    my ($gzip_path) = @_;
+    my ($gzip_path, $is_package) = @_;
     my ($signer, $signdate, @errors);
     my ($public_key, $signer_key_file, $signer_key_dir);
     my ($key_type, $num);
+    
+    print "DEBUG: Verifying " . ($is_package ? "package" : "plain/custom") . ": $gzip_path\n" if ($debug_flag);
 
-    # First, try with specific key.
     ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir,
 						 "$SIGNIFY_KEY_NAME.pub",
 						 $SIGNIFY_SEC_KEY);
-    @errors = Signify::signify_error();
-    # All good, signed by specific required key.
+    @errors = Signify::signify_error;
+    
     if (!@errors) {
+	print "DEBUG: Verified with expected key: $SIGNIFY_KEY_NAME.sec\n" if ($debug_flag);
 	return 1;
     }
-    # Check for optional keys.
-    # if pubkey is <domain>-(\d+)-pkg.pub and >= SIGNIFY_MIN_YEAR, it's
-    # ok.  if it's openbsd-(\d+)-pkg.pub and >= OPENBSD_MIN_VERSION, it's ok
+    
     elsif ($errors[0] =~ /public key is \"(.*)\" but/) {
 	$public_key = $1;
-	# public key for <domain> or openbsd
-	if ($public_key =~ /^\Q$DOMAINNAME\E-\d+-pkg\.pub$|^openbsd-\d+-pkg\.pub$/) {
-	    ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
-	    @errors = Signify::signify_error();
-	    # Didn't verify at all.
-	    if (@errors) {
-		print "@errors";
-		return 0;
-	    }
-	    ($signer_key_file, $signer_key_dir) = fileparse ($signer);
-	    if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
-		print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
-		return 0;
-	    }
-	    # secret key for <domain> or openbsd
-	    if ($signer_key_file =~ /^(\Q$DOMAINNAME\E)-(\d+)-pkg\.sec$|^(openbsd)-(\d+)-pkg\.sec$/) { 
+	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
+	@errors = Signify::signify_error;
+	
+	if (@errors) {
+	    print "@errors";
+	    return 0;
+	}
+	
+	($signer_key_file, $signer_key_dir) = fileparse ($signer);
+	if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
+	    print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
+	    return 0;
+	}
+	
+	if ($is_package) {
+	    if ($signer_key_file =~ /^([\w\.\-]+)-(\d+)-pkg\.sec$/) {
 		$key_type = $1;
 		$num = $2;
-		# Gotta meet minimum version requirements.
-		if (($key_type eq $DOMAINNAME && $num >= $SIGNIFY_MIN_YEAR) ||
-		    ($^O eq 'openbsd' && $key_type eq 'openbsd' && $num >= $OPENBSD_MIN_VERSION)) {
-		    return 1; # all good
+		if ($num >= $SIGNIFY_MIN_YEAR) {
+		    print "DEBUG: Package signed with valid key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
 		}
-		# Didn't meet minimum version requirements
 		else {
-		    print "Not signed by required key version, signed by $signer.\n";
+		    print "Package key $signer_key_file does not meet minimum year $SIGNIFY_MIN_YEAR.\n";
 		    return 0;
 		}
-	    } # not secret key for <domain> or openbsd
-	} # not public key for <domain> or openbsd
+	    }
+	    elsif ($^O eq 'openbsd' && $signer_key_file =~ /^(openbsd)-(\d+)-pkg\.sec$/) {
+		$key_type = $1;
+		$num = $2;
+		if ($num >= $OPENBSD_MIN_VERSION) {
+		    print "DEBUG: Package signed with OpenBSD key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
+		}
+		else {
+		    print "OpenBSD key $signer_key_file does not meet minimum version.\n";
+		    return 0;
+		}
+	    }
+	    else {
+		print "Package signed with unrecognized key pattern: $signer_key_file\n";
+		return 0;
+	    }
+	}
+	else {
+	    if ($signer_key_file =~ /^(\Q$DOMAINNAME\E)-(\d+)-pkg\.sec$/) {
+		$key_type = $1;
+		$num = $2;
+		if ($num >= $SIGNIFY_MIN_YEAR) {
+		    print "DEBUG: Plain/custom signed with own domain key: $signer_key_file\n" if ($debug_flag);
+		    return 1;
+		}
+		else {
+		    print "Domain key $signer_key_file does not meet minimum year.\n";
+		    return 0;
+		}
+	    }
+	    # Plain/custom with non-domain key
+	    else {
+		# For any other key, check if we should accept it
+		# In install.pl this prompts, in distribute.pl this rejects
+		if (can_accept_alternate_plain_key($signer_key_file)) {
+		    print "Accepted alternate signing key.\n";
+		    return 1;
+		}
+		else {
+		    print "Rejected alternate signing key.\n";
+		    return 0;
+		}
+	    }
+	}
     }
+    
     print "@errors";
     return 0;
+}
+
+# This just returns 0 in distribute.pl.
+sub can_accept_alternate_plain_key {
+    my ($key_file) = @_;
+    return should_accept_alternate_key ($key_file, "$SIGNIFY_KEY_NAME.sec");
 }
 
 # Subroutine used in both distribute.pl and install.pl, be sure to keep

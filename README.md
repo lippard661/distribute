@@ -29,9 +29,11 @@ deployed across a fleet:
 3. install.pl runs on each target host, verifies signatures, unlocks
    immutability flags as needed, installs, and re-locks
 
-All distributed content is signed with signify using annual domain-specific
-keys (e.g., `example.com-2026-pkg.sec`). install.pl verifies before
-installing anything.
+All distributed content is signed with signify. The recommended key naming
+convention is `<domain>-<year>-pkg` (e.g., `example.com-2026-pkg.sec`).
+install.pl verifies signatures before installing anything, and applies
+different trust levels depending on whether the signing key matches the
+expected domain key.
 
 ## Tools
 
@@ -54,22 +56,29 @@ each target host.
   gendoas.pl) and `ip-address` (updates config files when the home
   network WAN IP address changes)
 
-**Signing key management**: distribute.pl uses annual signify keys named
-`<domain>-<year>-pkg` derived from the hostname's domain. The `-p` flag
-uses the previous year's key (e.g., to distribute a new year's public key
-before the year rolls over). Warns in December if next year's public key
-is not yet present. Aborts if the current year's signing key is missing.
+**Signing key management**: distribute.pl defaults to an annual signify
+key named `<domain>-<year>-pkg` derived from the hostname's domain, but
+this can be overridden via `default-signing-key:` in the config or the
+`-k` flag on the command line. If the selected key does not follow the
+`<domain>-<year>-pkg` naming convention, distribute.pl warns and prompts
+before continuing, noting that plain/custom files signed with a
+non-standard key will require explicit user acceptance on the install side.
+Warns in December if next year's public key is not yet present. Aborts if
+the current year's signing key is missing.
 
 **Command line**:
 ```
-distribute.pl [-4|-6|-p|-c config|-h hosts|-d] item [item ...]
+distribute.pl [-4|-6|-p|-k keyname|-c config|-h hosts|-d] item [item ...]
 ```
 
 Options:
 ```
 -4          Use IPv4 for rsync (default)
 -6          Use IPv6 for rsync (for ip-address changes when IPv4 is down)
--p          Sign with prior year's key
+-p          Sign with prior year's domain key (mutually exclusive with -k)
+-k keyname  Sign with specified key (filename or filename.sec; key must
+            have its private key in /etc/signify). Overrides the default
+            signing key. Mutually exclusive with -p.
 -c config   Use specified config file (default: /etc/distribute.conf)
 -h hosts    Distribute only to specified hosts (comma-separated)
 -d          Debug output
@@ -183,7 +192,11 @@ host-list: host1, host2, host3
 syslock-groups-list: etc, local, reportnew, rsync, signify, ssl
 
 # Directory containing OpenBSD ports packages (amd64 default)
-# pkg-dir: /usr/ports/packages/amd64/all
+pkg-dir: /usr/ports/packages/amd64/all
+
+# Default signing key (optional; overrides domain-derived default).
+# $DOMAINNAME and $YEAR are available as special variables in this field only.
+# default-signing-key: $DOMAINNAME-$YEAR-pkg
 ```
 
 **Per-item entries** (one block per named item):
@@ -220,22 +233,64 @@ in the configured packages directory.
 
 ## Signify Key Conventions
 
-Keys are named `<domain>-<year>-pkg` where domain is derived from the
-hostname (last two components). For a host named `foo.example.com`, keys
-are named `example.com-2026-pkg.sec` and `example.com-2026-pkg.pub`.
+The recommended key naming convention is `<domain>-<year>-pkg`, where
+domain is derived from the hostname's last two components. For a host
+named `foo.example.com`, the default keys are `example.com-2026-pkg.sec`
+and `example.com-2026-pkg.pub`.
 
-Both distribute.pl and install.pl accept packages signed by:
-- The current domain key for the current year
-- The domain key for the prior year (for packages distributed before a
-  year rollover)
-- Standard OpenBSD package signing keys (`openbsd-<version>-pkg`)
+The default signing key can be overridden in `distribute.conf` using
+`default-signing-key:`, which accepts `$DOMAINNAME` and `$YEAR` as
+special variables. The `-k` flag on the command line overrides this
+further for a single run; `-k` and `-p` are mutually exclusive.
 
-**Current limitation**: the design assumes a single domain's keys plus
-OpenBSD's keys. If you want to use distribute/install to install packages
-from another source (e.g., packages signed with a different domain's key),
-the `verify_signature` subroutine in both scripts needs to be extended to
-accept additional trusted domain names. This is a known gap that will be
-addressed in a future update.
+If the selected signing key does not follow the `<domain>-<year>-pkg`
+naming convention, distribute.pl warns and prompts:
+
+```
+Warning: Signing key 'mykey' doesn't follow the standard pattern.
+Expected pattern: example.com-YEAR-pkg (e.g., example.com-2026-pkg)
+
+Plain/custom files signed with this key will require explicit user
+acceptance during installation on target systems.
+
+Continue with non-standard signing key? [y/n]:
+```
+
+**distribute.pl** accepts packages from any source for distribution,
+provided the signing key's public key is present in `/etc/signify` and
+follows the `-pkg` naming convention for the current or prior year.
+
+**install.pl** applies different trust levels depending on content type:
+
+For **packages** (OpenBSD `.tgz` files installed via pkg_add or the
+built-in minimal pkg_add): any valid `-pkg` key in `/etc/signify` for
+the current or prior year is accepted without prompting. Package signing
+is an independent process; the distribution key acts as a transport
+signature and packages may legitimately originate from multiple sources.
+
+For **plain and custom files** (content generated and signed directly by
+distribute.pl): files signed with the host's own domain key are installed
+without prompting. Files signed with a different key — even one present
+in `/etc/signify` — trigger an explicit confirmation prompt:
+
+```
+======================================================================
+SIGNATURE VERIFICATION WARNING
+======================================================================
+File is signed with: otherdomain.com-2026-pkg.sec
+Expected signing key: example.com-2026-pkg.sec
+
+The signing key is valid and in /etc/signify,
+but it is not the expected key for this system.
+
+Accept this key and install the file? [y/n]:
+```
+
+The prompt requires an explicit `yes`, `no`, `y`, or `n` followed by
+Enter; no default is accepted. This asymmetry reflects that plain and
+custom files are directly authored content where a foreign signing key
+is genuinely suspicious, unlike packages which may come from any
+trusted source.
 
 **Key security**: the signing key passphrase should not be stored on the
 distribute server itself. The recommended approach is to store it in a
@@ -400,4 +455,8 @@ https://github.com/lippard661
 
 ## License
 
-See LICENSE and individual files for license information.
+See individual files for license information.
+
+## Changelog
+
+See docs/ChangeLog for detailed modification history.
