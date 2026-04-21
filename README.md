@@ -400,8 +400,4 @@ https://github.com/lippard661
 
 ## License
 
-See individual files for license information.
-
-## Changelog
-
-See docs/ChangeLog for detailed modification history.
+See LICENSE and individual files for license information.
