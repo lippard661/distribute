@@ -6,11 +6,14 @@
 # Modified 10 February 2026 by Jim Lippard to use perl modules for temp file,
 #    do some minor cleanup, add pledge/unveil, add -o and -V options.
 # Modified 20 April 2026 by Jim Lippard to fix -V output.
+# Modified 2 May 2026 to use block eq greps, do better error checking,
+#    remove tmppath pledge.
 
 use strict;
 use warnings;
 use File::Basename qw( basename dirname );
 use File::Copy;
+use File::Spec;
 use Getopt::Std;
 use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp );
 use if $^O eq 'openbsd', 'OpenBSD::MkTemp', qw( mkdtemp );
@@ -33,13 +36,17 @@ my (%options, $output_file, $another_host, $hostname, $user, $date, $temp_dir, $
 getopts ('Vo:', \%options) || exit;
 
 if ($options{'V'}) {
-    print "gendoas.pl version 1.2 of 20 April 2026\n";
+    print "gendoas.pl version 1.3 of 2 May 2026\n";
     exit;
 }
 
 $output_file = $options{'o'} || $OUTPUT_FILE;
 
-die "Can't write directly to /etc.\n" if (dirname ($output_file) eq '/etc');
+my $abs_output = File::Spec->canonpath(File::Spec->rel2abs($output_file));
+my $abs_dir = dirname($abs_output);
+
+die "Cannot write under /etc with -o; run without -o to update /etc/doas.conf.\n"
+    if ($abs_dir eq '/etc' || $abs_dir =~ m{^/etc/});
 
 my $full_hostname = hostname() || die "Hostname is undefined.\n";
 (my $short_hostname, my $domain) = split (/\./, $full_hostname, 2);
@@ -54,7 +61,7 @@ else {
 }
 
 ## Pledge and unveil.
-pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'getpw', 'unveil') || die "Cannot pledge promises. $!\n";
+pledge ('rpath', 'wpath', 'cpath', 'getpw', 'unveil') || die "Cannot pledge promises. $!\n";
 
 unveil ($TEMPLATE, 'r');
 unveil ('/tmp', 'rwc');
@@ -101,8 +108,8 @@ while (<FILE>) {
 	    }
 	    # Check for match to current host.
 	    @host_array = split (/ /, $host_list);
-	    if ((!$all_except && grep (/^$hostname$/, @host_array)) ||
-		($all_except && !grep (/^$hostname$/, @host_array))) {
+	    if ((!$all_except && grep { $_ eq $hostname } @host_array) ||
+		($all_except && !grep { $_ eq $hostname } @host_array)) {
 		$host_match = 1;
 		print OUTPUT "$_";
 	    }
@@ -142,7 +149,12 @@ if ($another_host) {
 }
 else {
     # Create backup, copy temp file over original.
-    copy ($CONFIG_FILE, $BACKUP_CONFIG_FILE) && copy ("$temp_dir/$OUTPUT_FILE", $CONFIG_FILE);
+    copy ($CONFIG_FILE, $BACKUP_CONFIG_FILE)
+	|| die "Cannot create backup: $!\n";
+    copy ("$temp_dir/$OUTPUT_FILE", "$CONFIG_FILE.new")
+	|| die "Cannot copy new file: $!\n";
+    rename ("$CONFIG_FILE.new", $CONFIG_FILE)
+	|| die "Cannot rename new file over old file: $!\n";
 }
 
 # Remove temp file and temp dir.

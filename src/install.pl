@@ -97,14 +97,20 @@
 #    signed with a key other than the <domain>-<year>-pkg format, but
 #    to allow packages to be signed by any source for which there is
 #    a public key in /etc/signify.
+# Modified 2 May 2026 by Jim Lippard to check existence of public
+#    keys, validate @mode settings, use File::Temp for non-OpenBSD
+#    instead of direct call to mktemp, rename some variables and
+#    restructure some code for clarity.
 
 use strict;
+use warnings;
 use Archive::Tar;
 use Cwd;
 use Fcntl ':mode'; # For S_ISREG
 use File::Basename qw(fileparse basename dirname);
 use File::Copy qw(copy);
 use File::Path qw(rmtree make_path);
+use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp );
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
@@ -121,7 +127,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.0 of 21 April 2026.';
+my $VERSION = 'install.pl version 1.1 of 2 May 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -139,7 +145,6 @@ my @SYSLOCK_GROUPS = (
     'local'
     );
 
-my $MKTEMP = '/usr/bin/mktemp';
 my $PKG_ADD = '/usr/sbin/pkg_add';
 my $PWD = '/bin/pwd';
 my $SIGNIFY = '/usr/bin/signify'; # used only for unveil, for Signify.pm
@@ -223,11 +228,14 @@ $force_flag = $opts{'f'};
 $use_syslock = 0 if ($opts{'n'});
 $debug_flag = $opts{'d'};
 
-die "Cannot use -f and -n, they are mutually exclusive.\n" if ($force_flag && !$use_syslock);
+die "Cannot use -f and -n, they are mutually exclusive.\n" if ($opts{'f'} && $opts{'n'});
 
 if ($#ARGV != -1) {
     die "Usage: install.pl [-f (force)|-n (no syslock)|-V (version)|-d debug]\n";
 }
+
+# Die if weird characters in domain name.
+die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
 
 # Get user.
 $user = getpwuid($<);
@@ -239,19 +247,30 @@ if (!-e $SYSLOCK) {
    die "Cannot use -f because you don't have syslock.\n" if ($force_flag);
 }
 
+# Verify public key files exist.
+unless (-r $SIGNIFY_PUB_KEY || -r $PRIOR_SIGNIFY_PUB_KEY) {
+    die "Cannot find readable signify public keys.\n";
+}
+
 # Warn if next year's key hasn't shown up yet by two weeks before end of year.
 my ($month, $day) = (localtime (time()))[4, 3];
 $month++; # indexes are 0-11.
-if ($month == 12 && $day > 16 &&!-e $SIGNIFY_PUB_KEY_NEXT) {
+if ($month == 12 && $day > 16 && !-e $SIGNIFY_PUB_KEY_NEXT) {
     print "Warning: Next year's signing public key $SIGNIFY_PUB_KEY_NEXT isn't on this system.\n";
 }
 
 # Check securelevel if using syslock (and -f force_flag is not used).
 if ($use_syslock && !$force_flag && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
-    $securelevel = `$SYSCTL kern.securelevel`;
-    chomp ($securelevel);
-    if ($securelevel =~ /^.*=(\d+)$/) {
-	$securelevel = $1;
+    if (open (my $sysctl_fh, '-|', $SYSCTL, 'kern.securelevel')) {
+	$securelevel = <$sysctl_fh>;
+	close ($sysctl_fh);
+	chomp ($securelevel);
+	if ($^O eq 'darwin') {
+	    $securelevel =~ s/kern\.securelevel:\s*(\d+)/$1/;
+	}
+	else {
+	    $securelevel =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+	}
 	if ($securelevel != 0) {
 	    die "Cannot unlock immutable files and directories for installation while system securelevel >=0. Securelevel: $securelevel.\n";
 	}
@@ -364,21 +383,20 @@ if ($use_syslock) {
 	    # Check with audit (requires syslock-1.14 or later).
 	    system ($SYSUNLOCK, '-a', '-q', '-g', $syslock_group);
 	    my $audit_exit_code = $? >> 8;
-	    die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code)\n" if ($audit_exit_code != 0);
-	    print "Note: $syslock_group already unlocked.\n" if ($unlock_exit_code != 0);
+	    if ($audit_exit_code != 0) {
+		die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code, audit exit: $audit_exit_code)\n";
+	    }
+	    elsif ($unlock_exit_code != 0) {
+		print "Note: $syslock_group already fully unlocked.\n";
+	    }
 	}
     }
 }
 
 # Create temp dir. Needed for signature verification and for altering
 # package +CONTENTS files for minimal_pkg_add.
-if ($^O eq 'openbsd') {
-    $temp_dir = mkdtemp ('/tmp/install.XXXXXXX');
-}
-else {
-    $temp_dir = `$MKTEMP -d -q /tmp/install.XXXXXXX`;
-    chomp ($temp_dir);
-}
+$temp_dir = mkdtemp ('/tmp/install.XXXXXXX');
+chomp ($temp_dir);
 
 # For each file in the install dir:
 # If it is of the form <host>-<date>-<time>-package.tgz:
@@ -441,13 +459,7 @@ if (!$installed_something) {
 open (FILE, '>>', $CHANGELOG) || die "Cannot open $CHANGELOG for appending. $!\n";
 print FILE "\n";
 foreach $line (@changelog_entry) {
-    if (substr ($line, 0, 2) eq '\t') {
-	$line = substr ($line, 2, length ($line) - 2);
-	print FILE "\t$line\n";
-    }
-    else {
-	print FILE "$line\n";
-    }
+    print FILE "$line\n";
 }
 close (FILE);
 
@@ -470,6 +482,10 @@ sub install_pkg_add {
 	return 0; # failure
     }
 
+    # Note: there is a TOCTOU race condition here because while OpenBSD's
+    # pkg_add also checks for a signed package unless -D unsigned is
+    # used (against /etc/signify keys), it will bypass the warning from
+    # this script if it's not one of the expected signing keys.
     print "DEBUG: installing package $file\n" if ($debug_flag);
     if (system ($PKG_ADD, $file)) {
 	return 0; # failure (system returns nonzero for failure)
@@ -516,7 +532,7 @@ sub minimal_pkg_add {
     # Do another signify verification post-tar-read to mitigate TOCTOU race.
     if (!verify_signature ($file, 1)) { # 1 = is_package
 	print "Invalid or missing signature. Could not install package $file.\n";
-	return;
+	return 0;
     }
 
     $file_minus_tgz = basename ($file);
@@ -620,7 +636,16 @@ sub minimal_pkg_add {
 	# mode settings
 	elsif ($line =~ /^\@mode\s+(\S+)$/) {
 	    # Convert octal string to number
-	    $current_mode = oct($1);
+	    my $mode = oct($1);
+	    # Reject setuid/setgid/sticky bits
+	    if ($mode & 07000) {
+		die "Aborting: special mode bits not allowed in \@mode: $1\n";
+	    }
+	    # Reject world-writeable
+	    if ($mode & 0002) {
+		die "Aborting: world-writeable mode not allowed: $1\n";
+	    }
+	    $current_mode = $mode;
 	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
 	}
 	# timestamps
@@ -737,9 +762,9 @@ sub minimal_pkg_add {
 	# Extract any sample files. (Assumption: never happens unless there
 	# are other files to extract, otherwise this code won't be reached.)
 	print "DEBUG: extracting sample files\n" if ($debug_flag);
-	foreach $sample_file (keys (%samples_to_extract)) {
-	    if (!-e $samples_to_extract{$sample_file}) {
-		$sample_source_file = $sample_file;
+	foreach my $tar_source (keys (%samples_to_extract)) {
+	    if (!-e $samples_to_extract{$tar_source}) {
+		$sample_source_file = $tar_source;
 
 		# Look for custom config if on macOS or Linux.
 		if ($^O eq 'darwin' || $^O eq 'linux') {
@@ -784,23 +809,23 @@ sub minimal_pkg_add {
 		}
 		
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
-		$tar->extract_file ($sample_source_file, $samples_to_extract{$sample_file});
+		$tar->extract_file ($sample_source_file, $samples_to_extract{$tar_source});
 		# sample files are already an absolute path so no $DIR_PREFIX.
-		set_timestamp ($samples_to_extract{$sample_file}, $file_ts{$sample_file});
+		set_timestamp ($samples_to_extract{$tar_source}, $file_ts{$tar_source});
 		
 		# Set mode on sample file
-		if (defined($file_mode{$samples_to_extract{$sample_file}})) {
-		    my $full_path = $samples_to_extract{$sample_file};
-		    if (!chmod($file_mode{$samples_to_extract{$sample_file}}, $full_path)) {
-			print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$sample_file}}) . " on sample file $full_path. $!\n" if ($debug_flag);
+		if (defined($file_mode{$samples_to_extract{$tar_source}})) {
+		    my $full_path = $samples_to_extract{$tar_source};
+		    if (!chmod($file_mode{$samples_to_extract{$tar_source}}, $full_path)) {
+			print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$tar_source}}) . " on sample file $full_path. $!\n" if ($debug_flag);
 		    }
 		    elsif ($debug_flag) {
-			print "DEBUG: set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$sample_file}}) . " on sample file $full_path\n";
+			print "DEBUG: set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$tar_source}}) . " on sample file $full_path\n";
 		    }
 		}
 	    }
 	    else {
-		print "DEBUG: not extracting sample file $sample_file to already-existing $samples_to_extract{$sample_file}\n" if ($debug_flag);
+		print "DEBUG: not extracting sample file $tar_source to already-existing $samples_to_extract{$tar_source}\n" if ($debug_flag);
 	    }
 	}
 	
@@ -1075,9 +1100,9 @@ sub minimal_pkg_delete {
     close (FILE);
 
     # Look for installed sample configs.
-    foreach $sample_file (keys (%samples_to_delete)) {
-	if (-e $samples_to_delete{$sample_file}) {
-	    $sample_source_file = $sample_file;
+    foreach my $installed_file (keys (%samples_to_delete)) {
+	if (-e $samples_to_delete{$installed_file}) {
+	    $sample_source_file = $installed_file;
 
 	    # Look for custom config if on macOS or Linux.
 	    if ($^O eq 'darwin' || $^O eq 'linux') {
@@ -1123,18 +1148,18 @@ sub minimal_pkg_delete {
 
 	    # SECURITY FIX: check that it's unchanged against size/sha/ts of $sample_source_file
 	    # Use file handle to avoid TOCTOU race condition
-	    if (open (my $fh, '<', $samples_to_delete{$sample_file})) {
+	    if (open (my $fh, '<', $samples_to_delete{$installed_file})) {
 		# Get file stats while file is open
 		my @stat = stat($fh);
 		if (!@stat) {
-		    print "DEBUG: could not stat file $samples_to_delete{$sample_file}. $!\n" if ($debug_flag);
+		    print "DEBUG: could not stat file $samples_to_delete{$installed_file}. $!\n" if ($debug_flag);
 		    close ($fh);
 		    next;
 		}
 	    
 		# Verify it's a regular file (not symlink, device, etc.)
 		if (!S_ISREG($stat[2])) {
-		    print "DEBUG: $samples_to_delete{$sample_file} is not a regular file, skipping.\n" if ($debug_flag);
+		    print "DEBUG: $samples_to_delete{$installed_file} is not a regular file, skipping.\n" if ($debug_flag);
 		    close ($fh);
 		    next;
 		}
@@ -1143,7 +1168,7 @@ sub minimal_pkg_delete {
 		my $file_inode = $stat[1];
 	    
 		if ($file_size == $sample_size{$sample_source_file}) {
-		    print "DEBUG: size of $samples_to_delete{$sample_file} unchanged from $sample_source_file.\n" if ($debug_flag);
+		    print "DEBUG: size of $samples_to_delete{$installed_file} unchanged from $sample_source_file.\n" if ($debug_flag);
 		
 		    # Compute SHA256 from file handle
 		    $ctx = Digest::SHA->new(256);
@@ -1157,29 +1182,29 @@ sub minimal_pkg_delete {
 		
 		    if ($check_sha eq $sample_sha{$sample_source_file}) {
 			# Verify file hasn't been replaced between close and unlink
-			my @stat2 = stat($samples_to_delete{$sample_file});
+			my @stat2 = stat($samples_to_delete{$installed_file});
 			if (@stat2 && $stat2[1] == $file_inode && S_ISREG($stat2[2])) {
-			    print "DEBUG: removing unchanged sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
-			    if (!unlink ($samples_to_delete{$sample_file})) {
-				print "DEBUG: could not remove $samples_to_delete{$sample_file}. $!\n" if ($debug_flag);
+			    print "DEBUG: removing unchanged sample file $samples_to_delete{$installed_file}.\n" if ($debug_flag);
+			    if (!unlink ($samples_to_delete{$installed_file})) {
+				print "DEBUG: could not remove $samples_to_delete{$installed_file}. $!\n" if ($debug_flag);
 			    }
 			}
 			else {
-			    print "DEBUG: file $samples_to_delete{$sample_file} changed between check and delete, not removing.\n" if ($debug_flag);
+			    print "DEBUG: file $samples_to_delete{$installed_file} changed between check and delete, not removing.\n" if ($debug_flag);
 			}
 		    }
 		    elsif ($debug_flag) {
-			print "DEBUG: not removing changed (SHA256) sample file $samples_to_delete{$sample_file}.\n";
+			print "DEBUG: not removing changed (SHA256) sample file $samples_to_delete{$installed_file}.\n";
 			print "DEBUG: current: $check_sha, original: $sample_sha{$sample_source_file}.\n";
 		    }
 		}
 		else {
 		    close ($fh);
-		    print "DEBUG: not removing changed (size) sample file $samples_to_delete{$sample_file}.\n" if ($debug_flag);
+		    print "DEBUG: not removing changed (size) sample file $samples_to_delete{$installed_file}.\n" if ($debug_flag);
 		}
 	    }
 	    else {
-		print "DEBUG: could not open file $samples_to_delete{$sample_file} to check. $!\n" if ($debug_flag);
+		print "DEBUG: could not open file $samples_to_delete{$installed_file} to check. $!\n" if ($debug_flag);
 	    }
 	}
     }
@@ -1300,7 +1325,7 @@ sub verify_and_extract_package {
     foreach $fileobj (@fileobjs) {
 	$filedir = $fileobj->prefix;
 	$filename = $fileobj->name;
-	$line = '\t' . $THREE_SPACES . '/' . $filedir . '/' . $filename;
+	$line = "\t" . $THREE_SPACES . '/' . $filedir . '/' . $filename;
 	push (@output, $line);
     }
 

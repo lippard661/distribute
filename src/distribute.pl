@@ -96,7 +96,7 @@
 # Modified 1 January 2026 by Jim Lippard to fix bug in verify_signature
 #    when using secondary keys (pubkey dir no longer recorded).
 # Modified 3 January 2026 by Jim Lippard to check for existence of current
-#    year signing key and warn about next year's signing key 30 days in
+#    year signing key and warn about next year's signing key 31 days in
 #    advance.
 # Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls.
 # Modified 4 March 2026 by Jim Lippard to remove tmppath pledge.
@@ -109,12 +109,17 @@
 #    key for which the public key is in /etc/signify (this script doesn't
 #    sign packages but expects them to be signify-signed, e.g., with OpenBSD's
 #    pkg_sign or manually with signify).
+# Modified 2 May 2026 by Jim Lippard to use File::Temp on non-OpenBSD,
+#    wipe passphrase from memory after use, change all greps to eq block format,
+#    other minor improvements.
 
 use strict;
+use warnings;
 use Archive::Tar;
 use File::Basename qw(basename dirname fileparse);
 use File::Copy qw(copy cp);
 use File::Path qw(rmtree);
+use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp );
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
@@ -125,7 +130,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 
-my $VERSION = 'distribute.pl version 1.0 of 21 April 2026.';
+my $VERSION = 'distribute.pl version 1.1 of 2 May 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -143,7 +148,6 @@ my $RSYNC_HOST_SUFFIXv4 = '-distribute';
 my $RSYNC_HOST_SUFFIXv6 = '-distributev6';
 
 my $MKDIR = '/bin/mkdir';
-my $MKTEMP = '/usr/bin/mktemp';
 my $RSYNC = '/usr/local/bin/rsync';
 my $SIGNIFY = '/usr/bin/signify';
 my $STTY = '/bin/stty';
@@ -360,7 +364,7 @@ if ($signing_key_name !~ /^\Q$DOMAINNAME\E-\d+-pkg$/) {
 # Validate.
 foreach $arg (@ARGV) {
     die "Unknown file. $arg\n" if (!defined ($CONFIG{$arg}));
-    die "Error in config. Undefined TYPE \"$CONFIG{$arg}{TYPE}\".\n" if (!grep (/^$CONFIG{$arg}{TYPE}$/, @TYPES));
+    die "Error in config. Undefined TYPE \"$CONFIG{$arg}{TYPE}\".\n" if (!grep { $_ eq $CONFIG{$arg}{TYPE} } @TYPES);
     push (@files, $arg);
     if ($CONFIG{$arg}{TYPE} eq 'custom') {
 	push (@custom_pledges, @{$CUSTOM_PLEDGE{$arg}}) if ($CUSTOM_PLEDGE{$arg});
@@ -370,7 +374,7 @@ foreach $arg (@ARGV) {
 # Validate @selected_hosts;
 if ($opts{'h'}) {
     foreach $host (@selected_hosts) {
-	die "-h $opts{'h'} specifies host not defined in config. $host\n" if (!grep(/^$host$/, @HOSTS));
+	die "-h $opts{'h'} specifies host not defined in config. $host\n" if (!grep { $_ eq $host } @HOSTS);
     }
 }
 
@@ -418,7 +422,6 @@ if ($^O eq 'openbsd') {
     unveil ($PKG_DIR, 'r');
 
     # unveil commands.
-    # removed $MKTEMP.
     unveil ($MKDIR, 'rx');
     unveil ($RSYNC, 'rx');
     unveil ($SIGNIFY, 'rx');
@@ -443,13 +446,8 @@ if ($^O eq 'openbsd') {
 # Process.
 # Create temp dir. We didn't used to need it for packages but we do now
 # for signify signature verification due to error output going there.
-if ($^O eq 'openbsd') {
-    $temp_dir = mkdtemp ('/tmp/distribute.XXXXXXX');
-}
-else {
-    $temp_dir = `$MKTEMP -d -q /tmp/distribute.XXXXXXX`;
-    chomp ($temp_dir);
-}
+$temp_dir = mkdtemp ('/tmp/distribute.XXXXXXX');
+chomp ($temp_dir);
 
 foreach $file (@files) {
     @process_hosts = ();
@@ -460,7 +458,7 @@ foreach $file (@files) {
 
     # Put relevant hosts in @process_hosts.
     foreach $host (@{$CONFIG{$file}{HOSTS}}) {
-	next if ($host_option && !grep (/^$host$/, @selected_hosts));
+	next if ($host_option && !grep { $_ eq $host } @selected_hosts);
 	push (@process_hosts, $host);
     }
 
@@ -497,7 +495,7 @@ foreach $file (@files) {
     }
     elsif ($CONFIG{$file}{TYPE} eq 'plain') {
 	# Make sure file exists.
-	die "File in config can't be found. $! $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE});
+	die "File in config can't be found. $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE});
 	print "DEBUG: processing plain file $file\n" if ($debug_flag);
 
 	# If the destination is different from the source (DEST is used),
@@ -512,7 +510,8 @@ foreach $file (@files) {
 		# Make the fake directory (per-host).
 		make_fake_dir ($temp_dir, $dest_dir, $host);
 		# Copy the file into it. Preserve permissions.
-		cp ($CONFIG{$file}{FILE}, "$temp_dir/$host/$dest_path");
+		cp ($CONFIG{$file}{FILE}, "$temp_dir/$host/$dest_path")
+		    || die "Failed to copy $CONFIG{$file}{FILE} to $temp_dir/$host/$dest_path: $!\n";
 	    }
 	    $have_fake_dir = 1;
 	}
@@ -531,7 +530,7 @@ foreach $file (@files) {
 	# With commas should probably split it out and check for all, but
 	# will have to do $HOST substitution and check all relevant
 	# instances.
-	die "File in config can't be found. $! $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE} && $CONFIG{$file}{FILE} !~ /,/);
+	die "File in config can't be found. $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE} && $CONFIG{$file}{FILE} !~ /,/);
 	print "DEBUG: processing custom file $file\n" if ($debug_flag);
 
 	# Each is separate, for now. There may end up being some different
@@ -546,7 +545,8 @@ foreach $file (@files) {
 	# /etc, /etc/mail, /home/_rsyncu/.ssh
 	# This does not change /etc/faild.conf for hagbard.
 	elsif ($file eq 'ip-address') {
-	    _custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
+	    my $new_rsync_host_suffix = _custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
+	    $rsync_host_suffix = $new_rsync_host_suffix; # force v4 or v6 as needed
 	    $have_fake_dir = 1;
 	}
 	else {
@@ -591,6 +591,12 @@ foreach $host (keys (%host_package_files)) {
     }
 }
 
+# Wipe $signify_passphrase from memory if used.
+if (defined ($signify_passphrase)) {
+    $signify_passphrase = "x" x length ($signify_passphrase); # overwrite memory
+    $signify_passphrase = '';
+}
+
 # Now actually distribute the packages to the destinations.
 # Instead of doing one at a time we could ship all at once, which
 # might be a lot nicer. Would need to find all the matches and add
@@ -605,6 +611,10 @@ foreach $host (keys (%host_package_path)) {
 	    # system ("$RSYNC --rsync-path=/usr/local/sbin/rsync_wrapper.sh -avr $package_path $host-rsnapshot:/var/install/");
 	    # With rrsync: the authorized_keys file forces rrsync -doas /var/install.
 	}	    
+    }
+    if (!@rsync_file_list) {
+	warn "No files to distribute to $host.\n";
+	next;
     }
     print "Distributing to $host.\n";
     system ($RSYNC, '-avr', @rsync_file_list, "$host$rsync_host_suffix:.");
@@ -642,6 +652,7 @@ sub parse_config {
     my ($got_file, $got_dest, $got_type, $got_syslock_groups, $got_hosts);
     my (%macros, $macro_name, $have_macros, $more_to_process);
 
+    $current_name = undef;
     $line_no = 0;
     $context = $GLOBAL_CONTEXT;
 
@@ -766,7 +777,7 @@ sub parse_config {
 	    elsif ($field eq 'type') {
 		die "A \"type:\" field in global context on line $line_no. $_\n" if ($context == $GLOBAL_CONTEXT);
 		die "A second \"type:\" for $current_name on line $line_no. $_\n" if ($got_type);
-		die "Invalid type \"$value\" on line $line_no. $_\n" if (!grep (/^$value$/, @TYPES));
+		die "Invalid type \"$value\" on line $line_no. $_\n" if (!grep { $_ eq $value } @TYPES);
 		$CONFIG{$current_name}{TYPE} = $value;
 		$got_type = 1;
 		if ($got_dest && $CONFIG{$current_name}{TYPE} eq 'package') {
@@ -779,7 +790,7 @@ sub parse_config {
 		die "A second \"syslock-groups:\" for $current_name on line $line_no. $_\n" if ($got_syslock_groups);
 		@syslock_groups = split (/,\s*/, $value);
 		foreach $group (@syslock_groups) {
-		    next if grep (/^$group$/, @syslock_groups_list);
+		    next if grep { $_ eq $group } @syslock_groups_list;
 		    die "Unknown syslock group \"$group\" in \"syslock-groups:\" field on line $line_no. $_\n";
 		}
 		push (@{$CONFIG{$current_name}{SYSLOCKGROUPS}}, @syslock_groups);
@@ -826,19 +837,19 @@ sub parse_config {
 		    $value = $1;
 		    @except_hosts = split (/,\s*/, $value);
 		    foreach $host (@except_hosts) {
-			next if grep (/^$host$/, @host_list);
+			next if grep { $_ eq $host } @host_list;
 			die "Unknown host \"$host\" in \"hosts:\" field on line $line_no. $_\n";
 		    }
 		    @hosts = (); # empty array
 		    foreach $host (@host_list) {
-			next if grep (/^$host$/, @except_hosts);
+			next if grep { $_ eq $host } @except_hosts;
 			push (@hosts, $host);
 		    }
 		}
 		else { # just a list of hosts
 		    @hosts = split (/,\s*/, $value);
 		    foreach $host (@hosts) {
-			next if grep (/^$host$/, @host_list);
+			next if grep { $_ eq $host } @host_list;
 			die "Unknown host \"$host\" in \"hosts:\" field on line $line_no. $_\n";
 		    }
 		}
@@ -911,12 +922,55 @@ sub version_gt {
     return 0 if ($v1_major < $v2_major);
     return 1 if ($v1_minor > $v2_minor);
     return 0 if ($v1_minor < $v2_minor);
-    return 1 if ($v1_patch > $v2_patch);
-    return 0 if ($v1_patch < $v2_patch);
-    return 1 if ($v1_vv gt $v2_vv);
-    return 0 if ($v1_vv lt $v2_vv);
-    return 1 if ($v1_portrevision gt $v2_portrevision);
-    return 0;
+    
+    # Patch may be undef for maj.min(alpha)(pN) format
+    if (defined($v1_patch) && defined($v2_patch)) {
+        return 1 if ($v1_patch > $v2_patch);
+        return 0 if ($v1_patch < $v2_patch);
+    }
+    
+    # v_epoch can be either alpha (a-o) or epoch (vN)
+    if (defined($v1_vv) || defined($v2_vv)) {
+        my $e1 = $v1_vv // '';
+        my $e2 = $v2_vv // '';
+        
+        # If both are epoch format (vN), compare numerically
+        if ($e1 =~ /^v(\d+)$/ && $e2 =~ /^v(\d+)$/) {
+            my $n1 = $1;
+            $e2 =~ /^v(\d+)$/;
+            my $n2 = $1;
+            return 1 if ($n1 > $n2);
+            return 0 if ($n1 < $n2);
+        }
+        # If both are alpha (single letters), string comparison works
+        elsif ($e1 =~ /^[a-o]$/ && $e2 =~ /^[a-o]$/) {
+            return 1 if ($e1 gt $e2);
+            return 0 if ($e1 lt $e2);
+        }
+        # Mixed types - shouldn't happen for same package, but handle it
+        else {
+            return 1 if ($e1 gt $e2);
+            return 0 if ($e1 lt $e2);
+        }
+    }
+    
+    # portrevision is always pN format
+    if ($v1_portrevision =~ /^p(\d+)$/) {
+        my $pr1 = $1;
+        if ($v2_portrevision =~ /^p(\d+)$/) {
+            my $pr2 = $1;
+            return 1 if ($pr1 > $pr2);
+            return 0 if ($pr1 < $pr2);
+        }
+        # v2 has no portrevision (set to -1), v1 has one
+        return 1;
+    }
+    elsif ($v2_portrevision =~ /^p(\d+)$/) {
+        # v1 has no portrevision, v2 does
+        return 0;
+    }
+    
+    return 0; # equal
 }
 
 # Parses versions.
@@ -932,7 +986,7 @@ sub version_parse {
     $portrevision = -1; # if not found
 
     # maj.min.pat(pN)(vN)
-    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)*(v\d+)*$/) {
+    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -940,14 +994,14 @@ sub version_parse {
 	$v_epoch = $5 if (defined ($5));
     }
     # maj.min(alpha)(pN) (reportnew, py3-packaging)
-    elsif ($version =~ /^(\d+)\.(\d+)([a-o])*(p\d+)*$/) {
+    elsif ($version =~ /^(\d+)\.(\d+)([a-o])?(p\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$v_epoch = $3 if (defined ($3));
 	$portrevision = $4 if (defined ($4));
     }
     # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
-    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]*)(p\d+)*(v\d+)*$/) {
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]?)(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -961,7 +1015,7 @@ sub version_parse {
 	$v_epoch = $6 if (defined ($6));
     }
     # maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
-    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)*(v\d+)*$/) {
+    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -978,12 +1032,19 @@ sub version_parse {
 # Subroutine to get signify passphrase.
 sub get_signify_passphrase {
     my ($signify_passphrase);
+
+    # Set up signal handler to restore echo on interrupt
+    local $SIG{INT} = sub { 
+        system ($STTY, 'echo'); 
+        die "Interrupted\n"; 
+    };
     
     # Get signify passphrase.
     system ($STTY, '-echo');
     print "signify passphrase: ";
     $signify_passphrase = <STDIN>;
     system ($STTY, 'echo');
+    print "\n"; # newline after silent input
     chomp ($signify_passphrase);
     return ($signify_passphrase);
 }
@@ -994,7 +1055,8 @@ sub copy_package {
     my ($host, $file_basename, @ship_files);
 
     foreach $host (@hosts) {
-	copy ($pkg_path, "$INSTALL_DIR/$host/");
+	copy ($pkg_path, "$INSTALL_DIR/$host/")
+	    || die "Failed to copy $pkg_path to $INSTALL_DIR/$host: $!\n";
 	$file_basename = basename($pkg_path);
 	push (@ship_files, "$INSTALL_DIR/$host/$file_basename");
     }
@@ -1061,7 +1123,7 @@ sub _custom_validate_custom_vars {
 
     # Make sure all variables are either required or optional.
     foreach $custom_var (keys (%custom_vars)) {
-	die "Config specifies undefined custom variable \"$custom_var\" for $file.\n" if (!grep (/^$custom_var$/, keys (%req_opt_custom_vars)))
+	die "Config specifies undefined custom variable \"$custom_var\" for $file.\n" if (!grep { $_ eq $custom_var } keys (%req_opt_custom_vars));
     }
 }
 
@@ -1082,7 +1144,7 @@ sub _custom_doas_dot_conf {
     my $PERL = '/usr/bin/perl';
     my $GENDOAS = $custom_vars{'gendoas'};
 
-    die "$! $GENDOAS\n" if (!-e $GENDOAS);
+    die "Cannot find $GENDOAS.\n" if (!-e $GENDOAS);
 
     ($dest_file, $dest_dir) = fileparse ($dest_path);
     $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
@@ -1098,7 +1160,7 @@ sub _custom_doas_dot_conf {
 # Subroutine for custom IP address change.
 sub _custom_ip_address {
     my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
-    my (%custom_vars, $old_address, $new_address,
+    my (%custom_vars, $old_address, $new_address, $new_rsync_host_suffix,
 	@source_paths, @dest_paths,
 	$host, $idx, $source_path, $dest_path);
     # global: $have_fake_dir, %host_package_files
@@ -1115,8 +1177,9 @@ sub _custom_ip_address {
     %custom_vars = %{$custom_vars};
 
     my $CHMOD = '/bin/chmod';
-    
-    ($old_address, $new_address) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});;
+
+    # Will determine and return $new_rsync_host_suffix to force v4/v6 as needed.
+    ($old_address, $new_address, $new_rsync_host_suffix) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
     @source_paths = split (/,/, $file);
     @dest_paths = split (/,/, $dest);
 #	    $have_fake_dir = 1; done after call to this subroutine
@@ -1147,7 +1210,8 @@ sub _custom_ip_address {
 		make_fake_dir ($temp_dir, $dest_dir, $host);
 		# Copy the source file to the destination. -p to
 		# preserve permissions. (Doesn't work for pf.conf.)
-		cp ($source_path, "$temp_dir/$host/$dest_path");
+		cp ($source_path, "$temp_dir/$host/$dest_path")
+		    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
 
 		# Update the file by changing the IP addresses.
 		_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address);
@@ -1163,17 +1227,20 @@ sub _custom_ip_address {
 	    }
 	}
     }
+
+    return $new_rsync_host_suffix;
 }
 
 # Subroutine to get old external IP address from DNS and new
 # external IP address via prompt.
 # Assumes IPv6 is tunnel over wan0.
+# Returns $new_rsync_host_suffix up for $rsync_host_suffix to be changed in main.
 sub _custom_get_old_and_new_ip_addresses {
     my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $dns, $wan0, $wan1) = @_;
     use Socket qw( :addrinfo SOCK_RAW );
     my ($old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1, $host_fqdn);
-    my ($err);
+    my $new_rsync_host_suffix;
 
     $lc_wan0 = lc ($wan0);
 
@@ -1189,7 +1256,7 @@ sub _custom_get_old_and_new_ip_addresses {
 	print "$wan0 or $wan1? ";
 	$wan0_or_wan1 = <STDIN>;
 	chomp ($wan0_or_wan1);
-	$wan0_or_wan1 =~ tr/A-Z/a-z/;
+	$wan0_or_wan1 = lc ($wan0_or_wan1);
 	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
     }
 
@@ -1199,13 +1266,13 @@ sub _custom_get_old_and_new_ip_addresses {
 	print "Distributing via v4 (default) since v6 tunnel is down.\n";
 	print "Warning: Must manually update $ipv6_name tunnel.\n";
 	print "Warning: Must manually update firewall tunnel and policies.\n";
-	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	$new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
 	$host_fqdn = $wan0_host_fqdn;
     }
     else { # wan1
 	print "Distributing via v6 since v4 address doesn't have access.\n";
 	print "Warning: Must manually update DNS record via $dns.\n";
-	$rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
+	$new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
 	$host_fqdn = $wan1_host_fqdn;
     }
     if (defined ($host_fqdn)) {
@@ -1218,7 +1285,8 @@ sub _custom_get_old_and_new_ip_addresses {
 	print "Old address: $old_address (return or enter correct): ";
 	my $input_string = <STDIN>;
 	chomp ($input_string);
-	if ($input_string =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+	if ($input_string =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+	    && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) {
 	    $old_address = $input_string;
 	    last;
 	}
@@ -1236,10 +1304,11 @@ sub _custom_get_old_and_new_ip_addresses {
     	  print "New IP Address: ";
     	  $new_address = <STDIN>;
     	  chomp ($new_address);
-	  $new_address = 'null' if ($new_address !~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
+	  $new_address = 'null' if ($new_address !~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+				    && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);
     }
     
-    return ($old_address, $new_address);
+    return ($old_address, $new_address, $new_rsync_host_suffix);
 }
 
 # Subroutine to get WAN IP from fqdn.
@@ -1271,11 +1340,11 @@ sub _custom_global_replace_in_file {
 
     $backup_file = $file . '.bak';
 
-    rename ($file, $backup_file);
-    open (INFILE, '<' . $backup_file) or die "Cannot open file. $backup_file $!\n";
-    open (OUTFILE, '>' . $file) || die "Cannot open file for writing. $file $!\n";
+    rename ($file, $backup_file) || die "Cannot rename $file to $backup_file. $!\n";
+    open (INFILE, '<', $backup_file) || die "Cannot open file. $backup_file $!\n";
+    open (OUTFILE, '>', $file) || die "Cannot open file for writing. $file $!\n";
     while (<INFILE>) {
-	s/$string/$replace/g;
+	s/\Q$string\E/$replace/g;
 	print OUTFILE $_;
     }
     close (INFILE);
@@ -1291,7 +1360,7 @@ sub add_syslock_groups {
     my ($syslock_group);
 
     foreach $syslock_group (@{$config_syslock_groups}) {
-	push (@syslock_groups, $syslock_group) unless (grep (/^$syslock_group$/, @syslock_groups));
+	push (@syslock_groups, $syslock_group) unless (grep { $_ eq $syslock_group } @syslock_groups);
     }
     
     return (@syslock_groups);

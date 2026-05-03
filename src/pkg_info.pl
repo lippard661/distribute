@@ -5,42 +5,52 @@
 # in conjunction with install.pl.
 # Written 5 October 2025 by Jim Lippard
 # Modified 4 January 2026 by Jim Lippard to remove & on subroutine calls.
+# Modified 2 May 2026 by Jim Lippard for minor improvements.
 
 use strict;
 use warnings;
 
 my $PKG_DIR = '/var/db/pkg';
 
-my ($arg, $package, @packages);
+my ($arg, $package, @all_packages, @found_packages);
 
 if ($#ARGV == -1) {
     list_all_brief();
     exit;
 }
 
+@all_packages = get_all_packages();
+
 foreach $arg (@ARGV) {
-    $package = find_package ($arg);
-    push (@packages, $package) if ($package);
+    $package = find_package ($arg, @all_packages);
+    push (@found_packages, $package) if ($package);
 }
 
-die "No valid packages specified.\n" unless (@packages);
+die "No valid packages specified.\n" unless (@found_packages);
 
-foreach $package (@packages) {
+foreach $package (@found_packages) {
     show_package_desc ($package);
+}
+
+# Subroutine to get all packages.
+sub get_all_packages {
+    my (@all_packages);
+
+    opendir (DIR, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
+    @all_packages = grep (!/^\.{1,2}/, readdir (DIR));
+    closedir (DIR);
+
+    return (@all_packages);
 }
 
 # Subroutine to find a matching package name.
 sub find_package {
-    my ($package_string) = @_;
-    my (@packages, $package);
+    my ($package_string, @all_packages) = @_;
+    my $package;
 
-    opendir (DIR, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
-    @packages = grep (!/^\.{1,2}/, readdir (DIR));
-    closedir (DIR);
-
-    foreach $package (@packages) {
+    foreach $package (@all_packages) {
 	return ($package) if ($package eq $package_string);
-	if ($package =~ /^$package_string-\d/) { # must match up to a version number, not just any substring.
+	if ($package =~ /^\Q$package_string\E-\d/) { # must match up to a version number, not just any substring.
 	    return ($package);
 	}
     }
@@ -50,26 +60,30 @@ sub find_package {
 }
 
 sub list_all_brief {
-    my (@packages, $package, $package_name,
+    my (@all_packages, $package, $package_name,
 	$one_liner);
 
     opendir (DIR, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
-    @packages = grep (!/^\.{1,2}/, readdir (DIR));
+    @all_packages = grep (!/^\.{1,2}$/, readdir (DIR));
     closedir (DIR);
 
-    foreach $package (sort @packages) {
+    foreach $package (sort @all_packages) {
 	$package_name = 0;
-	open (FILE, '<', "$PKG_DIR/$package/+CONTENTS") || die "Cannot open +CONTENTS for package $package. $!\n";
+	if (!open (FILE, '<', "$PKG_DIR/$package/+CONTENTS")) {
+	    warn "Skipping $package: Cannot open +CONTENTS. $!\n";
+	    next;
+	}
 	while (<FILE>) {
 	    if (/^\@name (.*)$/) {
 		$package_name = $1;
 	    }
 	}
 	close (FILE);
-	die "Cannot find \"\@name\" in +CONTENTS for package $package.\n" if (!$package_name);
+	die "Cannot find \"\@name\" in +CONTENTS for package $package.\n" unless (defined ($package_name) && length ($package_name) > 0);
 	
 	open (FILE, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
 	$one_liner = <FILE>;
+	$one_liner = '' unless defined ($one_liner);
 	chomp ($one_liner);
 	close (FILE);
 
