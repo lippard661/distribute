@@ -101,6 +101,11 @@
 #    keys, validate @mode settings, use File::Temp for non-OpenBSD
 #    instead of direct call to mktemp, rename some variables and
 #    restructure some code for clarity.
+# Modified 4 May 2026 by Jim Lippard to remove etc as a default syslock
+#    group (but keep it as a directory to unveil by default), fix some
+#    non-fatal issues discovered after adding "use warnings", and check
+#    for existence of syslock.conf, not just syslock binary. Change
+#    version_gt subroutine to match distribute.pl.
 
 use strict;
 use warnings;
@@ -127,7 +132,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.1 of 2 May 2026.';
+my $VERSION = 'install.pl version 1.2 of 4 May 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -141,7 +146,6 @@ my @DEST_LOCATIONS = (
     );
 
 my @SYSLOCK_GROUPS = (
-    'etc',
     'local'
     );
 
@@ -151,6 +155,7 @@ my $SIGNIFY = '/usr/bin/signify'; # used only for unveil, for Signify.pm
 my $SYSCTL = '/usr/sbin/sysctl';
 my $SYSLOCK = '/usr/local/bin/syslock';
 my $SYSUNLOCK = '/usr/local/bin/sysunlock';
+my $SYSLOCK_CONF = '/etc/syslock.conf';
 my $UNAME = '/usr/bin/uname';
 
 my $CHANGELOG = '/etc/CHANGELOG';
@@ -241,10 +246,10 @@ die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
 $user = getpwuid($<);
 die "Error. Must be run by root.\n" if ($user ne 'root');
 
-# If no syslock, don't use syslock.
-if (!-e $SYSLOCK) {
+# If no syslock or config file, don't use syslock.
+if (!-e $SYSLOCK || !-e $SYSLOCK_CONF) {
    $use_syslock = 0;
-   die "Cannot use -f because you don't have syslock.\n" if ($force_flag);
+   die "Cannot use -f because you don't have syslock binary and config file.\n" if ($force_flag);
 }
 
 # Verify public key files exist.
@@ -602,7 +607,7 @@ sub minimal_pkg_add {
     foreach $line (@lines) {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
 	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
-		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$dir");
+		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$line");
 		$dir_mode{$line} = $current_mode;
 	    }
 	    elsif (valid_filepath ($line)) { # otherwise it's a file
@@ -705,7 +710,7 @@ sub minimal_pkg_add {
 	$substitute_linux || $substitute_macos) {
 	# Set timestamps and modes.
 	foreach $file_extracted (@files_to_extract) {
-	    set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted});
+	    set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted} // 0);
 	    
 	    # Set mode on file if we have one recorded
 	    if (defined($file_mode{$file_extracted})) {
@@ -730,7 +735,7 @@ sub minimal_pkg_add {
 		}
 		else { # set timestamp, fix gid for Linux, and set mode
 		    if ($substitute_linux) {
-			set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file});
+			set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = "$DIR_PREFIX/$substitute_extract{$substitute_file}";
@@ -744,7 +749,7 @@ sub minimal_pkg_add {
 		    }
 		    if ($substitute_macos) {
 			# already an absolute path for macOS.
-			set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file});
+			set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = $substitute_extract{$substitute_file};
@@ -811,7 +816,7 @@ sub minimal_pkg_add {
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
 		$tar->extract_file ($sample_source_file, $samples_to_extract{$tar_source});
 		# sample files are already an absolute path so no $DIR_PREFIX.
-		set_timestamp ($samples_to_extract{$tar_source}, $file_ts{$tar_source});
+		set_timestamp ($samples_to_extract{$tar_source}, $file_ts{$tar_source} // 0);
 		
 		# Set mode on sample file
 		if (defined($file_mode{$samples_to_extract{$tar_source}})) {
@@ -987,7 +992,7 @@ sub older_package_installed {
 # Delete a package.
 sub minimal_pkg_delete {
     my ($file) = @_;
-    my (@lines, $line, @dirs_to_delete, $dir_to_delete,
+    my (@lines, $line, $last_file_to_delete, @dirs_to_delete, $dir_to_delete,
 	@files_to_delete, $file_to_delete,
 	$sample_file, $sample_source_file,
 	%samples_to_delete, %sample_size, %sample_sha, %sample_ts,
@@ -1057,6 +1062,7 @@ sub minimal_pkg_delete {
 		else {
 		    push (@files_to_delete, "$DIR_PREFIX/$_");
 		}
+		$last_file_to_delete = $files_to_delete[-1];
 	    }
 	}
 	# @sample is already a full path.
@@ -1076,19 +1082,21 @@ sub minimal_pkg_delete {
 	    # Will typically be last file from @files_to_extract. Key is
 	    # file in tar file, value is full path of destination.
 	    else {
-		$samples_to_delete{$files_to_delete[-1]} = $sample_file;
+		if (defined ($last_file_to_delete)) {
+		    $samples_to_delete{$last_file_to_delete} = $sample_file;
+		}
 	    }
 	}
 	# don't delete samples that have changed size/sha/ts.
 	# don't delete non-empty dirs.
 	elsif (/^\@size (\d+)$/) {
-	    $sample_size{$files_to_delete[-1]} = $1;
+	    $sample_size{$last_file_to_delete} = $1 if (defined ($last_file_to_delete));
 	}
 	elsif (/^\@sha (.*)$/) {
-	    $sample_sha{$files_to_delete[-1]} = $1;
+	    $sample_sha{$last_file_to_delete} = $1 if (defined ($last_file_to_delete));
 	}
 	elsif (/^\@ts (.*)$/) {
-	    $sample_ts{$files_to_delete[-1]} = $1;
+	    $sample_ts{$last_file_to_delete} = $1 if (defined ($last_file_to_delete));
 	}
 	elsif (/^\@cwd (.*)$/) {
 	    if ($1 ne $DIR_PREFIX) {
@@ -1495,12 +1503,55 @@ sub version_gt {
     return 0 if ($v1_major < $v2_major);
     return 1 if ($v1_minor > $v2_minor);
     return 0 if ($v1_minor < $v2_minor);
-    return 1 if ($v1_patch > $v2_patch);
-    return 0 if ($v1_patch < $v2_patch);
-    return 1 if ($v1_vv gt $v2_vv);
-    return 0 if ($v1_vv lt $v2_vv);
-    return 1 if ($v1_portrevision gt $v2_portrevision);
-    return 0;
+    
+    # Patch may be undef for maj.min(alpha)(pN) format
+    if (defined($v1_patch) && defined($v2_patch)) {
+        return 1 if ($v1_patch > $v2_patch);
+        return 0 if ($v1_patch < $v2_patch);
+    }
+    
+    # v_epoch can be either alpha (a-o) or epoch (vN)
+    if (defined($v1_vv) || defined($v2_vv)) {
+        my $e1 = $v1_vv // '';
+        my $e2 = $v2_vv // '';
+        
+        # If both are epoch format (vN), compare numerically
+        if ($e1 =~ /^v(\d+)$/ && $e2 =~ /^v(\d+)$/) {
+            my $n1 = $1;
+            $e2 =~ /^v(\d+)$/;
+            my $n2 = $1;
+            return 1 if ($n1 > $n2);
+            return 0 if ($n1 < $n2);
+        }
+        # If both are alpha (single letters), string comparison works
+        elsif ($e1 =~ /^[a-o]$/ && $e2 =~ /^[a-o]$/) {
+            return 1 if ($e1 gt $e2);
+            return 0 if ($e1 lt $e2);
+        }
+        # Mixed types - shouldn't happen for same package, but handle it
+        else {
+            return 1 if ($e1 gt $e2);
+            return 0 if ($e1 lt $e2);
+        }
+    }
+    
+    # portrevision is always pN format
+    if ($v1_portrevision =~ /^p(\d+)$/) {
+        my $pr1 = $1;
+        if ($v2_portrevision =~ /^p(\d+)$/) {
+            my $pr2 = $1;
+            return 1 if ($pr1 > $pr2);
+            return 0 if ($pr1 < $pr2);
+        }
+        # v2 has no portrevision (set to -1), v1 has one
+        return 1;
+    }
+    elsif ($v2_portrevision =~ /^p(\d+)$/) {
+        # v1 has no portrevision, v2 does
+        return 0;
+    }
+    
+    return 0; # equal
 }
 
 # Subroutine used in both distribute.pl and install.pl, be sure to keep
