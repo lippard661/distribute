@@ -106,6 +106,14 @@
 #    non-fatal issues discovered after adding "use warnings", and check
 #    for existence of syslock.conf, not just syslock binary. Change
 #    version_gt subroutine to match distribute.pl.
+# Modified 17 May 2026 by Jim Lippard to observe Linux and macOS
+#    conventions on group for binary installations instead of imposing
+#    OpenBSD conventions. Changed set_timestamp to set_timestamp_and_gid.
+#    Changed behavior of syslock/sysunlock with new audit capabilities.
+#    Main principle: unlock when necessary, re-lock groups we unlocked.
+#    It doesn't necessarily leave things as they were before but it
+#    leaves the groups we unlocked fully locked (even if they were
+#    only partially locked when we started).
 
 use strict;
 use warnings;
@@ -132,7 +140,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.2 of 4 May 2026.';
+my $VERSION = 'install.pl version 1.3 of 18 May 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -264,8 +272,8 @@ if ($month == 12 && $day > 16 && !-e $SIGNIFY_PUB_KEY_NEXT) {
     print "Warning: Next year's signing public key $SIGNIFY_PUB_KEY_NEXT isn't on this system.\n";
 }
 
-# Check securelevel if using syslock (and -f force_flag is not used).
-if ($use_syslock && !$force_flag && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
+# Obtain securelevel if using syslock (but don't abort if -f force_flag is used).
+if ($use_syslock && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
     if (open (my $sysctl_fh, '-|', $SYSCTL, 'kern.securelevel')) {
 	$securelevel = <$sysctl_fh>;
 	close ($sysctl_fh);
@@ -276,7 +284,7 @@ if ($use_syslock && !$force_flag && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =
 	else {
 	    $securelevel =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
 	}
-	if ($securelevel != 0) {
+	if ($securelevel != 0 && !$force_flag) {
 	    die "Cannot unlock immutable files and directories for installation while system securelevel >=0. Securelevel: $securelevel.\n";
 	}
     }
@@ -379,22 +387,70 @@ $date = strftime ("%Y-%m-%d", localtime (time()));
 push (@changelog_entry, "$date-$user:");
 
 # Unlock system.
+# Behavior: For each syslock group, check if unlocking is needed before doing
+# so. Only unlock groups that have locked entries. Track which groups we
+# unlock so we can re-lock only those at the end. When -f (force) is used
+# at elevated securelevel (BSD/macOS only), we also pre-check for schg/sappnd
+# locks that cannot be cleared, failing before any modification is made to
+# avoid leaving the system in an asymmetric state. After installation,
+# re-locking a group restores its configured state per syslock.conf - any
+# pre-existing mixed-lock anomalies will be corrected to the configured
+# state rather than preserved.
+my %unlocked_by_us;
+
 if ($use_syslock) {
     foreach $syslock_group (@SYSLOCK_GROUPS) {
-	print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
-	system ($SYSUNLOCK, '-g', $syslock_group);
-	my $unlock_exit_code = $? >> 8;
-	if ($force_flag) {
-	    # Check with audit (requires syslock-1.14 or later).
-	    system ($SYSUNLOCK, '-a', '-q', '-g', $syslock_group);
-	    my $audit_exit_code = $? >> 8;
-	    if ($audit_exit_code != 0) {
-		die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code, audit exit: $audit_exit_code)\n";
-	    }
-	    elsif ($unlock_exit_code != 0) {
-		print "Note: $syslock_group already fully unlocked.\n";
-	    }
-	}
+        # Pre-check schg/sappnd locks - only meaningful on BSD/macOS at
+        # elevated securelevel where these flags cannot be cleared.
+        if ($force_flag && $^O ne 'linux' && $securelevel > 0) {
+            # If group is an explicit :uchg or :uappnd, no schg/sappnd to worry about.
+            unless ($syslock_group =~ /:uchg$|:uappnd$/) {
+                # If untagged group or explicit :schg, check for locked schg members
+                if ($syslock_group !~ /:sappnd$/) {
+                    my $test_group = $syslock_group;
+                    $test_group = $syslock_group . ':schg' if ($syslock_group !~ /:schg$/);
+                    system ($SYSUNLOCK, '-g', $test_group, '-a', '-q');
+                    my $schg_audit_code = $? >> 8;
+                    if ($schg_audit_code != 0) {
+                        die "Group $syslock_group has active schg locks that cannot be cleared at current securelevel. Aborting before modification.\n";
+                    }
+                }
+                # If untagged group or explicit :sappnd, check for locked sappnd members
+                if ($syslock_group !~ /:schg$/) {
+                    my $test_group = $syslock_group;
+                    $test_group = $syslock_group . ':sappnd' if ($syslock_group !~ /:sappnd$/);
+                    system ($SYSUNLOCK, '-g', $test_group, '-a', '-q');
+                    my $sappnd_audit_code = $? >> 8;
+                    if ($sappnd_audit_code != 0) {
+                        die "Group $syslock_group has active sappnd locks that cannot be cleared at current securelevel. Aborting before modification.\n";
+                    }
+                }
+            }
+        }
+        
+        # Check if unlock is needed at all.
+        system ($SYSUNLOCK, '-g', $syslock_group, '-a', '-o', '-q');
+        my $needs_unlock = ($? >> 8) != 0;
+        
+        if ($needs_unlock) {
+            print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
+            system ($SYSUNLOCK, '-g', $syslock_group);
+            my $unlock_exit_code = $? >> 8;
+            $unlocked_by_us{$syslock_group} = 1;
+            
+            # Post-check: verify the unlock actually succeeded (only meaningful 
+            # on BSD/macOS at elevated securelevel where partial unlocks can happen).
+            if ($force_flag && $^O ne 'linux' && $securelevel > 0) {
+                system ($SYSUNLOCK, '-a', '-q', '-g', $syslock_group);
+                my $audit_exit_code = $? >> 8;
+                if ($audit_exit_code != 0) {
+                    die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code, audit exit: $audit_exit_code)\n";
+                }
+            }
+        }
+        else {
+            print "DEBUG: $syslock_group already unlocked, skipping\n" if ($debug_flag);
+        }
     }
 }
 
@@ -443,11 +499,19 @@ foreach $file (@files) {
     }
 }
 
+# Re-lock system. Only re-lock groups that we actually unlocked.
+# Note: This restores the configured state per syslock.conf rather than
+# the exact prior state. Any pre-existing partial-lock anomalies will be
+# corrected to the configured state.
 if ($use_syslock) {
-    # Re-lock system.
     foreach $syslock_group (@SYSLOCK_GROUPS) {
-	print "DEBUG: locking syslock group $syslock_group\n" if ($debug_flag);
-	system ($SYSLOCK, '-g', $syslock_group);
+        if ($unlocked_by_us{$syslock_group}) {
+            print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
+            system ($SYSLOCK, '-g', $syslock_group);
+        }
+        else {
+            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
+        }
     }
 }
 
@@ -710,7 +774,7 @@ sub minimal_pkg_add {
 	$substitute_linux || $substitute_macos) {
 	# Set timestamps and modes.
 	foreach $file_extracted (@files_to_extract) {
-	    set_timestamp ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted} // 0);
+	    set_timestamp_and_gid ("$DIR_PREFIX/$file_extracted", $file_ts{$file_extracted} // 0);
 	    
 	    # Set mode on file if we have one recorded
 	    if (defined($file_mode{$file_extracted})) {
@@ -735,7 +799,7 @@ sub minimal_pkg_add {
 		}
 		else { # set timestamp, fix gid for Linux, and set mode
 		    if ($substitute_linux) {
-			set_timestamp ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file} // 0);
+			set_timestamp_and_gid ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = "$DIR_PREFIX/$substitute_extract{$substitute_file}";
@@ -749,7 +813,7 @@ sub minimal_pkg_add {
 		    }
 		    if ($substitute_macos) {
 			# already an absolute path for macOS.
-			set_timestamp ($substitute_extract{$substitute_file}, $file_ts{$substitute_file} // 0);
+			set_timestamp_and_gid ($substitute_extract{$substitute_file}, $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = $substitute_extract{$substitute_file};
@@ -816,7 +880,7 @@ sub minimal_pkg_add {
 		print "DEBUG: extracting sample file $sample_source_file\n" if ($debug_flag);
 		$tar->extract_file ($sample_source_file, $samples_to_extract{$tar_source});
 		# sample files are already an absolute path so no $DIR_PREFIX.
-		set_timestamp ($samples_to_extract{$tar_source}, $file_ts{$tar_source} // 0);
+		set_timestamp_and_gid ($samples_to_extract{$tar_source}, $file_ts{$tar_source} // 0);
 		
 		# Set mode on sample file
 		if (defined($file_mode{$samples_to_extract{$tar_source}})) {
@@ -881,9 +945,9 @@ sub valid_filepath {
 }
 
 # Subroutine to set timestamps and fix gid.
-sub set_timestamp {
+sub set_timestamp_and_gid {
     my ($file, $timestamp) = @_;
-    my ($atime, $gid);
+    my ($atime);
 
     $atime = time();
 
@@ -896,10 +960,14 @@ sub set_timestamp {
 	}
     }
 
-    if ($^O eq 'linux') {
-	# bin is 7 on *BSD and macOS, but 2 on Linux, so fix.
-	$gid = getgrnam ('bin');
-	chown (-1, $gid, $file);
+    if ($^O eq 'linux' || $^O eq 'darwin') {
+	# Was using 'bin' on all platforms to follow the OpenBSD convention
+	# (and fixing Linux here since bin is group 2 on Linux and 7 on
+	# *BSD and macOS), but now just using local convention on each
+	# platform. Packages are created on OpenBSD and use bin; we
+	# change here to root for Linux and wheel for macOS which are both
+	# 0.
+	chown (-1, 0, $file);
     }
 }
 
