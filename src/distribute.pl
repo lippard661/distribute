@@ -657,10 +657,10 @@ chdir ('/tmp');
 rmtree ($temp_dir);
 
 # Report failed hosts.
-print "Distribution failed for: @failed_hosts\n";
+print "Distribution failed for: @failed_hosts\n" if ($had_errors);
 
 # Exit.
-exit 1 if $had_errors;
+exit 1 if ($had_errors);
 exit 0;
 
 ### Subroutines.
