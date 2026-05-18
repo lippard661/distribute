@@ -6,8 +6,10 @@
 # Modified 10 February 2026 by Jim Lippard to use perl modules for temp file,
 #    do some minor cleanup, add pledge/unveil, add -o and -V options.
 # Modified 20 April 2026 by Jim Lippard to fix -V output.
-# Modified 2 May 2026 to use block eq greps, do better error checking,
+# Modified 2 May 2026 by Jim Lippard to use block eq greps, do better error checking,
 #    remove tmppath pledge.
+# Modified 18 May 2026 by Jim Lippard to remove bareword filehandles, only use
+#    pledge/unveil on OpenBSD, and reject non-commented lines after Gemini review.
 
 use strict;
 use warnings;
@@ -36,7 +38,7 @@ my (%options, $output_file, $another_host, $hostname, $user, $date, $temp_dir, $
 getopts ('Vo:', \%options) || exit;
 
 if ($options{'V'}) {
-    print "gendoas.pl version 1.3 of 2 May 2026\n";
+    print "gendoas.pl version 1.4 of 18 May 2026\n";
     exit;
 }
 
@@ -60,36 +62,38 @@ else {
     $another_host = 0;
 }
 
-## Pledge and unveil.
-pledge ('rpath', 'wpath', 'cpath', 'getpw', 'unveil') || die "Cannot pledge promises. $!\n";
+## Pledge and unveil. (OpenBSD only)
+if ($^O eq 'openbsd') {
+    pledge ('rpath', 'wpath', 'cpath', 'getpw', 'unveil') || die "Cannot pledge promises. $!\n";
 
-unveil ($TEMPLATE, 'r');
-unveil ('/tmp', 'rwc');
-unveil (dirname ($output_file), 'rwc');
-unveil ($output_file, 'rwc');
-if (!$another_host) {
-    # Need to create or overwrite the doas.conf on this host.
-    unveil ('/etc', 'rwc');
-    unveil ($CONFIG_FILE, 'rwc');
+    unveil ($TEMPLATE, 'r');
+    unveil ('/tmp', 'rwc');
+    unveil (dirname ($output_file), 'rwc');
+    unveil ($output_file, 'rwc');
+    if (!$another_host) {
+	# Need to create or overwrite the doas.conf on this host.
+	unveil ('/etc', 'rwc');
+	unveil ($CONFIG_FILE, 'rwc');
+    }
+    unveil ();
 }
-unveil ();
 
 # Open template.
-open (FILE, '<', $TEMPLATE) || die "Cannot open template $TEMPLATE. $!\n";
+open (my $template_fh, '<', $TEMPLATE) || die "Cannot open template $TEMPLATE. $!\n";
 
 # Open tempfile.
 $temp_dir = mkdtemp ("/tmp/$ME.XXXXXXXX") || die "Cannot create temp dir. $!\n";
 chomp ($temp_dir);
-open (OUTPUT, '>', "$temp_dir/$OUTPUT_FILE") || die "Cannot open $temp_dir/$OUTPUT_FILE. $!\n";
+open (my $output_fh, '>', "$temp_dir/$OUTPUT_FILE") || die "Cannot open $temp_dir/$OUTPUT_FILE. $!\n";
 
 $host_match = 1;
 
 $user = getpwuid($<);
 $date = localtime (time());
-print OUTPUT "# doas.conf for $hostname created with $ME by user $user on $date.\n";
+print $output_fh "# doas.conf for $hostname created with $ME by user $user on $date.\n";
 
 # Read template, write temp file.
-while (<FILE>) {
+while (<$template_fh>) {
     if (/^\s*#\s*hosts:\s*(.*$)/) {
 	$all_except = 0;
 	$host_list = $1;
@@ -99,7 +103,7 @@ while (<FILE>) {
 	}
 	elsif ($host_list eq 'all') {
 	    $host_match = 1;
-	    print OUTPUT "$_";
+	    print $output_fh "$_";
 	}
 	else {
 	    if ($host_list =~ /^all except\s*(.*$)/) {
@@ -111,7 +115,7 @@ while (<FILE>) {
 	    if ((!$all_except && grep { $_ eq $hostname } @host_array) ||
 		($all_except && !grep { $_ eq $hostname } @host_array)) {
 		$host_match = 1;
-		print OUTPUT "$_";
+		print $output_fh "$_";
 	    }
 	    else {
 		$host_match = 0;
@@ -121,26 +125,29 @@ while (<FILE>) {
     elsif (/^\s*#\s*(deny|permit)(.*$)/) {
 	# Commented line with deny/permit. If host_match, then we remove the comment.
 	# Otherwise, we omit it.
-	print OUTPUT "$1$2\n" if ($host_match);
+	print $output_fh "$1$2\n" if ($host_match);
 	# If the line ends with a \, then we continue comment removal on subsequent lines.
 	$continuation_line = 1 if ($2 =~ /\\$/);
     }
     elsif ($continuation_line) {
 	$continuation_line = 0 if (!/\\$/);
 	if (/^\s*#(.*$)/) {
-	    print OUTPUT "$1\n" if ($host_match);
+	    print $output_fh "$1\n" if ($host_match);
 	}
 	else {
-	    print OUTPUT "$_" if ($host_match);
+	    die "Template error at line $.: continuation line is not commented: $_";
 	}
     }
+        elsif (/^\s*#/ || /^\s*$/) {
+        # Comment or blank line - pass through if host_match
+        print $output_fh "$_" if ($host_match);
+    }
     else {
-	# Anything else gets written out if we're in host_match.
-	print OUTPUT "$_" if ($host_match);
+        die "Template error at line $.: line is not commented: $_";
     }
 }
-close (OUTPUT);
-close (FILE);
+close ($output_fh);
+close ($template_fh);
 
 if ($another_host) {
     # If we're building a doas.conf for another host, put it in the

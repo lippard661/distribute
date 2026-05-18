@@ -112,6 +112,9 @@
 # Modified 2 May 2026 by Jim Lippard to use File::Temp on non-OpenBSD,
 #    wipe passphrase from memory after use, change all greps to eq block format,
 #    other minor improvements.
+# Modified 18 May 2026 by Jim Lippard to better remove leading slashes on destination
+#    paths when building packages and check return error codes on rsyncs and collect
+#    list of failed hosts to report at exit. Stop using bareword filehandle names.
 
 use strict;
 use warnings;
@@ -130,7 +133,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 
-my $VERSION = 'distribute.pl version 1.1 of 2 May 2026.';
+my $VERSION = 'distribute.pl version 1.2 of 18 May 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -505,7 +508,7 @@ foreach $file (@files) {
 	if ($CONFIG{$file}{DEST}) {
 	    $dest_path = $CONFIG{$file}{DEST};
 	    ($dest_file, $dest_dir) = fileparse ($dest_path);
-	    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
+	    $dest_path =~ s{^/+}{}; # remove leading slashes
 	    foreach $host (@process_hosts) {
 		# Make the fake directory (per-host).
 		make_fake_dir ($temp_dir, $dest_dir, $host);
@@ -602,6 +605,8 @@ if (defined ($signify_passphrase)) {
 # might be a lot nicer. Would need to find all the matches and add
 # them to the command line list, then use the same list to unlink
 # them.
+my $had_errors = 0;
+my @failed_hosts;
 foreach $host (keys (%host_package_path)) {
     @rsync_file_list = ();
     foreach $package_path (@files_to_ship_and_remove) {
@@ -617,7 +622,22 @@ foreach $host (keys (%host_package_path)) {
 	next;
     }
     print "Distributing to $host.\n";
-    system ($RSYNC, '-avr', @rsync_file_list, "$host$rsync_host_suffix:.");
+    my $rc = system ($RSYNC, '-avr', @rsync_file_list, "$host$rsync_host_suffix:.");
+    if ($rc == -1) {
+	warn "Failed to execute rsync for $host: $!\n";
+	$had_errors = 1;
+    }
+    elsif ($rc & 127) {
+	warn sprintf("rsync for %s died with signal %d\n",
+		     $host, ($rc & 127));
+	$had_errors = 1;
+    }
+    elsif (($rc >> 8) != 0) {
+	warn sprintf("rsync for %s exited with status %d\n",
+		     $host, ($rc >> 8));
+	$had_errors = 1;
+    }
+    push (@failed_hosts, $host) if ($rc != 0);
 }
 
 # Now clean it all up and delete them.
@@ -635,6 +655,13 @@ chdir ('/tmp');
 
 # Delete temp dir.
 rmtree ($temp_dir);
+
+# Report failed hosts.
+print "Distribution failed for: @failed_hosts\n";
+
+# Exit.
+exit 1 if $had_errors;
+exit 0;
 
 ### Subroutines.
 
@@ -656,8 +683,8 @@ sub parse_config {
     $line_no = 0;
     $context = $GLOBAL_CONTEXT;
 
-    open (FILE, '<', $config_file) || die "Cannot open config file $config_file. $!\n";
-    while (<FILE>) {
+    open (my $config_fh, '<', $config_file) || die "Cannot open config file $config_file. $!\n";
+    while (<$config_fh>) {
 	chomp;
 	$line_no++;
 	if (/^\s*#|^\s*$/) {
@@ -864,7 +891,7 @@ sub parse_config {
 	    die "Unknown config line on line $line_no. $_\n";
 	}
     }
-    close (FILE);
+    close ($config_fh);
 
     # Did we get required fields for last "name:"? Same checks as at each subsequent "name:" above.
     die "No \"file:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_file);
@@ -1341,14 +1368,14 @@ sub _custom_global_replace_in_file {
     $backup_file = $file . '.bak';
 
     rename ($file, $backup_file) || die "Cannot rename $file to $backup_file. $!\n";
-    open (INFILE, '<', $backup_file) || die "Cannot open file. $backup_file $!\n";
-    open (OUTFILE, '>', $file) || die "Cannot open file for writing. $file $!\n";
-    while (<INFILE>) {
+    open (my $infile_fh, '<', $backup_file) || die "Cannot open file. $backup_file $!\n";
+    open (my $outfile_fh, '>', $file) || die "Cannot open file for writing. $file $!\n";
+    while (<$infile_fh>) {
 	s/\Q$string\E/$replace/g;
-	print OUTFILE $_;
+	print $outfile_fh $_;
     }
-    close (INFILE);
-    close (OUTFILE);
+    close ($infile_fh);
+    close ($outfile_fh);
     unlink ($backup_file);
 }
 
@@ -1371,11 +1398,11 @@ sub create_syslock_group_file {
     my ($file, @syslock_groups) = @_;
     my $syslock_group;
 
-    open (FILE, '>', $file) || die "Cannot open $file for writing. $!\n";
+    open (my $syslock_group_fh, '>', $file) || die "Cannot open $file for writing. $!\n";
     foreach $syslock_group (@syslock_groups) {
-	print FILE "$syslock_group\n";
+	print $syslock_group_fh "$syslock_group\n";
     }
-    close (FILE);
+    close ($syslock_group_fh);
 }
 
 ### Following subroutines are present in both distribute.pl and install.pl
