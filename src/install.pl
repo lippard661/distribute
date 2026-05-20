@@ -116,7 +116,8 @@
 #    only partially locked when we started). Changed bareword filehandles
 #    to $fh format.
 # Modified 20 May 2026 by Jim Lippard to make second check in verify_signature
-#    also fail fast.
+#    also fail fast and to simplify pre-install syslock audit checks by removing
+#    the post-unlock audit check, quitting on failed sysunlock and cleaning up.
 
 use strict;
 use warnings;
@@ -362,7 +363,7 @@ if ($use_syslock) {
 		while (<$fh>) {
 		    chomp;
 		    my $group = $_; # grep overwrites $_ for its own ends
-		    push (@SYSLOCK_GROUPS, $group) unless (grep (/^$group$/, @SYSLOCK_GROUPS));
+		    push (@SYSLOCK_GROUPS, $group) unless (grep { $_ eq $group } @SYSLOCK_GROUPS);
 		}
 		close ($fh);
 		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
@@ -431,7 +432,9 @@ if ($use_syslock) {
             }
         }
         
-        # Check if unlock is needed at all.
+        # Check if unlock is needed at all. This is fast in the expected state
+	# when everything is locked, but slow if everything or almost everything
+	# is unlocked.
         system ($SYSUNLOCK, '-g', $syslock_group, '-a', '-o', '-q');
         my $needs_unlock = ($? >> 8) != 0;
         
@@ -439,20 +442,21 @@ if ($use_syslock) {
             print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
             system ($SYSUNLOCK, '-g', $syslock_group);
             my $unlock_exit_code = $? >> 8;
+
+	    if ($unlock_exit_code != 0) {
+		# Re-lock any groups we already unlocked before dying.
+		relock_groups();
+		die "Failed to unlock syslock group $syslock_group (exit: $unlock_exit_code).\n";
+	    }
             $unlocked_by_us{$syslock_group} = 1;
-            
-            # Post-check: verify the unlock actually succeeded (only meaningful 
-            # on BSD/macOS at elevated securelevel where partial unlocks can happen).
-            if ($force_flag && $^O ne 'linux' && $securelevel > 0) {
-                system ($SYSUNLOCK, '-a', '-q', '-g', $syslock_group);
-                my $audit_exit_code = $? >> 8;
-                if ($audit_exit_code != 0) {
-                    die "Group $syslock_group is not fully unlocked after sysunlock (sysunlock exit: $unlock_exit_code, audit exit: $audit_exit_code)\n";
-                }
-            }
-        }
-        else {
-            print "DEBUG: $syslock_group already unlocked, skipping\n" if ($debug_flag);
+
+	    # Skip post-check audit to verify unlock (previously only for
+	    # BSD/macOS with securelevel > 0 where partial unlocks can happen.
+	    # The potential race condition between the schg/sappnd checks above
+	    # and the results of the unlock if another process is locking things
+	    # in the group with schg wasn't solved by a post-unlock audit;
+	    # sysunlock failure should give us a better result due to the slowness
+	    # of the post-unlock audit that delayed the installation.
         }
     }
 }
@@ -506,17 +510,7 @@ foreach $file (@files) {
 # Note: This restores the configured state per syslock.conf rather than
 # the exact prior state. Any pre-existing partial-lock anomalies will be
 # corrected to the configured state.
-if ($use_syslock) {
-    foreach $syslock_group (@SYSLOCK_GROUPS) {
-        if ($unlocked_by_us{$syslock_group}) {
-            print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
-            system ($SYSLOCK, '-g', $syslock_group);
-        }
-        else {
-            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
-        }
-    }
-}
+relock_groups () if ($use_syslock);
 
 # Remove temp dir.
 rmtree ($temp_dir);
@@ -536,6 +530,19 @@ foreach $line (@changelog_entry) {
 close ($fh);
 
 ### Subroutines.
+
+# Subroutine to relock syslock groups.
+sub relock_groups {
+    foreach my $syslock_group (@SYSLOCK_GROUPS) {
+        if ($unlocked_by_us{$syslock_group}) {
+            print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
+            system ($SYSLOCK, '-g', $syslock_group);
+        }
+        else {
+            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
+        }
+    }
+}
 
 # Install a package with pkg_add.
 # Should fail if not signed by a key in /etc/signify.
