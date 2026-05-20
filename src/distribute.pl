@@ -110,11 +110,13 @@
 #    sign packages but expects them to be signify-signed, e.g., with OpenBSD's
 #    pkg_sign or manually with signify).
 # Modified 2 May 2026 by Jim Lippard to use File::Temp on non-OpenBSD,
-#    wipe passphrase from memory after use, change all greps to eq block format,
-#    other minor improvements.
+#    wipe passphrase from memory after use, change all greps to eq block
+#    format, other minor improvements.
 # Modified 18 May 2026 by Jim Lippard to better remove leading slashes on destination
 #    paths when building packages and check return error codes on rsyncs and collect
 #    list of failed hosts to report at exit. Stop using bareword filehandle names.
+# Modified 20 May 2026 by Jim Lippard to make second check in verify_signature
+#    also fail fast.
 
 use strict;
 use warnings;
@@ -1453,8 +1455,8 @@ sub verify_signature {
     }
     
     elsif ($errors[0] =~ /public key is \"(.*)\" but/) {
-	$public_key = $1;
-	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
+	(my $pubkey_dir, $public_key) = fileparse ($1); # $pubkey_dir ignored, no longer present anymore
+	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir, $public_key);
 	@errors = Signify::signify_error;
 	
 	if (@errors) {

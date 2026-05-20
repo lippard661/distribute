@@ -18,8 +18,8 @@ Also included in this repo:
 
 The OpenBSD packages are signed with signify. To verify:
 ```
-signify -C -p discord.org-2026-pkg.pub -x install-1.0.tgz
-signify -C -p discord.org-2026-pkg.pub -x distribute-1.0.tgz
+signify -C -p discord.org-2026-pkg.pub -x install-<version>.tgz
+signify -C -p discord.org-2026-pkg.pub -x distribute-<version>.tgz
 ```
 Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 

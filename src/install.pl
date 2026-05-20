@@ -113,7 +113,10 @@
 #    Main principle: unlock when necessary, re-lock groups we unlocked.
 #    It doesn't necessarily leave things as they were before but it
 #    leaves the groups we unlocked fully locked (even if they were
-#    only partially locked when we started).
+#    only partially locked when we started). Changed bareword filehandles
+#    to $fh format.
+# Modified 20 May 2026 by Jim Lippard to make second check in verify_signature
+#    also fail fast.
 
 use strict;
 use warnings;
@@ -338,9 +341,9 @@ $installed_something = 0;
 # Check $INSTALL_DIR for contents; if any, then unlock.
 # If not, say nothing to install.
 # Ignore .sig signify files.
-opendir (DIR, $INSTALL_DIR) || die "Cannot open $INSTALL_DIR to read files. $!\n";
-@files = grep (!/^\.{1,2}$|\.sig$/, readdir (DIR));
-closedir (DIR);
+opendir (my $dir_fh, $INSTALL_DIR) || die "Cannot open $INSTALL_DIR to read files. $!\n";
+@files = grep (!/^\.{1,2}$|\.sig$/, readdir ($dir_fh));
+closedir ($dir_fh);
 
 if ($use_syslock) {
     # Add any signed .grp files to syslock groups to unlock/lock.
@@ -355,13 +358,13 @@ if ($use_syslock) {
 	    # Verify.
 	    if (Signify::verify ("$INSTALL_DIR/$file", $SIGNIFY_PUB_KEY) ||
 		Signify::verify ("$INSTALL_DIR/$file", $PRIOR_SIGNIFY_PUB_KEY)) {
-		open (FILE, '<', "$INSTALL_DIR/$file") || die "Cannot open syslock group file. $! $INSTALL_DIR/$file\n";
-		while (<FILE>) {
+		open (my $fh, '<', "$INSTALL_DIR/$file") || die "Cannot open syslock group file. $! $INSTALL_DIR/$file\n";
+		while (<$fh>) {
 		    chomp;
 		    my $group = $_; # grep overwrites $_ for its own ends
 		    push (@SYSLOCK_GROUPS, $group) unless (grep (/^$group$/, @SYSLOCK_GROUPS));
 		}
-		close (FILE);
+		close ($fh);
 		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
 	    }
 	    else {
@@ -525,12 +528,12 @@ if (!$installed_something) {
 }
 
 # Update CHANGELOG.
-open (FILE, '>>', $CHANGELOG) || die "Cannot open $CHANGELOG for appending. $!\n";
-print FILE "\n";
+open (my $fh, '>>', $CHANGELOG) || die "Cannot open $CHANGELOG for appending. $!\n";
+print $fh "\n";
 foreach $line (@changelog_entry) {
-    print FILE "$line\n";
+    print $fh "$line\n";
 }
-close (FILE);
+close ($fh);
 
 ### Subroutines.
 
@@ -911,11 +914,11 @@ sub minimal_pkg_add {
 	$tar->extract_file('+DESC', "$PKG_DIR/$file_minus_tgz/+DESC");
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
-	    if (open (FILE, '<', "$PKG_DIR/$file_minus_tgz/+DISPLAY")) {
-		while (<FILE>) {
+	    if (open (my $fh, '<', "$PKG_DIR/$file_minus_tgz/+DISPLAY")) {
+		while (<$fh>) {
 		    print "$_";
 		}
-		close (FILE);
+		close ($fh);
 	    }
 	}
 	return 1;
@@ -977,18 +980,18 @@ sub set_timestamp_and_gid {
 sub update_package_contents_file {
     my ($file, $original, $substitution) = @_;
 
-    if (open (FILE, '<', $file)) { # open input +CONTENTS
-	if (open (TEMP, '>', "$temp_dir/+CONTENTS")) { # open temp +CONTENTS
-	    while (<FILE>) {
+    if (open (my $fh, '<', $file)) { # open input +CONTENTS
+	if (open (my $temp_fh, '>', "$temp_dir/+CONTENTS")) { # open temp +CONTENTS
+	    while (<$fh>) {
 		if (!/^[\@\+]/) {
 		    if (/^$original/) {
 			$_ =~ s/^$original/$substitution/;
 		    }
 		}
-		print TEMP $_;
+		print $temp_fh $_;
 	    } # while
-	    close (FILE);
-	    close (TEMP);
+	    close ($fh);
+	    close ($temp_fh);
 	    copy ("$temp_dir/+CONTENTS", $file);
 	    unlink ("$temp_dir/+CONTENTS");
 	} # open temp +CONTENTS
@@ -1096,8 +1099,8 @@ sub minimal_pkg_delete {
 
     # Read +CONTENTS, looking for dirs and files to delete and sample files
     # to potentially delete.
-    open (FILE, '<', "$PKG_DIR/$file/+CONTENTS");
-    while (<FILE>) {
+    open (my $fh, '<', "$PKG_DIR/$file/+CONTENTS");
+    while (<$fh>) {
 	chomp;
 	if (!/^[\@\+]/) { # lines not beginning with @ or +
 	    if (!valid_filepath ($_)) {
@@ -1173,7 +1176,7 @@ sub minimal_pkg_delete {
 	    }
 	}
     }
-    close (FILE);
+    close ($fh);
 
     # Look for installed sample configs.
     foreach my $installed_file (keys (%samples_to_delete)) {
@@ -1474,8 +1477,8 @@ sub verify_signature {
     }
     
     elsif ($errors[0] =~ /public key is \"(.*)\" but/) {
-	$public_key = $1;
-	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir);
+	(my $pubkey_dir, $public_key) = fileparse ($1); # $pubkey_dir ignored, no longer present anymore
+	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir, $public_key);
 	@errors = Signify::signify_error;
 	
 	if (@errors) {

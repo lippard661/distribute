@@ -6,6 +6,7 @@
 # Written 5 October 2025 by Jim Lippard
 # Modified 4 January 2026 by Jim Lippard to remove & on subroutine calls.
 # Modified 2 May 2026 by Jim Lippard for minor improvements.
+# Modified 17 May 2026 by Jim Lippard to not use bareword filehandles.
 
 use strict;
 use warnings;
@@ -63,29 +64,30 @@ sub list_all_brief {
     my (@all_packages, $package, $package_name,
 	$one_liner);
 
-    opendir (DIR, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
-    @all_packages = grep (!/^\.{1,2}$/, readdir (DIR));
-    closedir (DIR);
+    opendir (my $dir_fh, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
+    @all_packages = grep (!/^\.{1,2}$/, readdir ($dir_fh));
+    closedir ($dir_fh);
 
     foreach $package (sort @all_packages) {
 	$package_name = 0;
-	if (!open (FILE, '<', "$PKG_DIR/$package/+CONTENTS")) {
+	my $pkg_fh;
+	if (!open ($pkg_fh, '<', "$PKG_DIR/$package/+CONTENTS")) {
 	    warn "Skipping $package: Cannot open +CONTENTS. $!\n";
 	    next;
 	}
-	while (<FILE>) {
+	while (<$pkg_fh>) {
 	    if (/^\@name (.*)$/) {
 		$package_name = $1;
 	    }
 	}
-	close (FILE);
+	close ($pkg_fh);
 	die "Cannot find \"\@name\" in +CONTENTS for package $package.\n" unless (defined ($package_name) && length ($package_name) > 0);
 	
-	open (FILE, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
-	$one_liner = <FILE>;
+	open (my $desc_fh, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
+	$one_liner = <$desc_fh>;
 	$one_liner = '' unless defined ($one_liner);
 	chomp ($one_liner);
-	close (FILE);
+	close ($desc_fh);
 
 	printf "%-19s %s\n", $package_name, $one_liner;
     }
@@ -95,16 +97,16 @@ sub show_package_desc {
     my ($package) = @_;
     my ($one_liner);
     
-    open (FILE, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
-    $one_liner = <FILE>;
+    open (my $fh, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
+    $one_liner = <$fh>;
     chomp ($one_liner);
     print "Information for inst:$package\n\n";
     print "Comment:\n$one_liner\n\nDescription:\n";
-    while (<FILE>) {
+    while (<$fh>) {
 	chomp;
 	print "$_\n";
     }
-    close (FILE);
+    close ($fh);
 
     # Just to be identical to pkg_info.
     print "\n\n";
