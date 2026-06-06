@@ -118,6 +118,9 @@
 # Modified 20 May 2026 by Jim Lippard to make second check in verify_signature
 #    also fail fast and to simplify pre-install syslock audit checks by removing
 #    the post-unlock audit check, quitting on failed sysunlock and cleaning up.
+# Modified 6 June 2026 by Jim Lippard to add 'chown' pledge in addition to 'fattr'
+#    which is necessary for root to chown files to a group it isn't a member of
+#    (new in 7.9??).
 
 use strict;
 use warnings;
@@ -302,9 +305,12 @@ if ($use_syslock && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
 # into significant places, but at least protects most system binaries
 # and home directories. Will have to open up further if distribute.pl
 # is used to install things in other locations.
+# 'chown' is needed in addition to 'fattr' just in case the tar
+# extraction of a plain/custom file sets the group to one root isn't
+# a member of.
 if ($^O eq 'openbsd') {
     my $location_dir;
-    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'exec', 'proc', 'unveil') || die "Cannot pledge promises. $!\n";
+    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'chown', 'exec', 'proc', 'unveil') || die "Cannot pledge promises. $!\n";
     # Unveil /.
     unveil ('/', 'r');
     
