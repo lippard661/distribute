@@ -117,6 +117,8 @@
 #    list of failed hosts to report at exit. Stop using bareword filehandle names.
 # Modified 20 May 2026 by Jim Lippard to make second check in verify_signature
 #    also fail fast.
+# Modified 8 June 2026 by Claude at the direction of Jim Lippard to generate
+#    syslock grp files if needed by packages.
 
 use strict;
 use warnings;
@@ -135,7 +137,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 
-my $VERSION = 'distribute.pl version 1.2 of 18 May 2026.';
+my $VERSION = 'distribute.pl version 1.3 of 8 June 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -496,6 +498,29 @@ foreach $file (@files) {
 	($dest_file, $dest_dir) = fileparse ($package_path);
 	foreach $host (@process_hosts) {
 	    $host_package_path{$host} = "$INSTALL_DIR/$host/$dest_file";
+
+	    # Create syslock group file if any syslock groups specified.
+            if (@{$syslock_groups{$host}}) {
+                print "DEBUG: creating syslock group file for package $dest_file for $host\n" if ($debug_flag);
+                print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
+                
+                # Get passphrase if not already obtained (may not have
+                # plain/custom files that would normally trigger this).
+                if (!defined ($signify_passphrase)) {
+                    $signify_passphrase = get_signify_passphrase();
+                }
+                
+                my $grp_file = "$host_package_path{$host}.grp";
+                create_syslock_group_file ($grp_file, @{$syslock_groups{$host}});
+                # Sign it.
+                if (!Signify::sign ($grp_file, $signify_passphrase, $signing_sec_key)) {
+                    @errors = Signify::signify_error();
+                    die "Could not sign syslock group file $grp_file with $signing_key_name: @errors\n";
+                }
+		# Add directly - already in $INSTALL_DIR/$host/, no copy needed
+                push (@files_to_ship_and_remove, $grp_file);
+                push (@files_to_ship_and_remove, "$grp_file.sig");
+	    }
 	}
     }
     elsif ($CONFIG{$file}{TYPE} eq 'plain') {
@@ -564,7 +589,8 @@ foreach $file (@files) {
 }
 
 # %host_package_files are packages we created that need to be signed.
-if (%host_package_files) {
+# Get passphrase for signing plain/custom files if not already obtained.
+if (%host_package_files && !defined ($signify_passphrase)) {
     $signify_passphrase = get_signify_passphrase();
 }
 
