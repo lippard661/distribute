@@ -121,6 +121,9 @@
 # Modified 6 June 2026 by Jim Lippard to add 'chown' pledge in addition to 'fattr'
 #    which is necessary for root to chown files to a group it isn't a member of
 #    (new in 7.9??).
+# Modified 29 June 2026 by Jim Lippard to only print contents of +DISPLAY for
+#    a package install if it's a new install or the contents have changed from
+#    the previously installed version.
 
 use strict;
 use warnings;
@@ -147,7 +150,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.3 of 18 May 2026.';
+my $VERSION = 'install.pl version 1.4 of 29 June 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -669,11 +672,16 @@ sub minimal_pkg_add {
     # (3) Process in reverse (files to remove, directories to remove if empty,
     #     files to remove if unchanged, checking for custom installed configs
     #     for macOS/linux.
+    my $old_pkg_display_hash;
     if ($older_package = older_package_installed ($file)) {
 	if ($older_package =~ /^newer:(.*)$/) {
 	    print "Newer package $1 already installed.\n";
 	    return 0;
 	}
+
+	# Get +DISPLAY hash.
+	$old_pkg_display_hash = get_pkg_display_hash ($older_package);
+	
 	print "DEBUG: deleting package $older_package with builtin minimal pkg_delete.\n" if ($debug_flag);
 	if (!minimal_pkg_delete ($older_package)) {
 	    print "Package delete of $older_package failed. Not installing $file.\n";
@@ -927,11 +935,18 @@ sub minimal_pkg_add {
 	$tar->extract_file('+DESC', "$PKG_DIR/$file_minus_tgz/+DESC");
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
-	    if (open (my $fh, '<', "$PKG_DIR/$file_minus_tgz/+DISPLAY")) {
-		while (<$fh>) {
-		    print "$_";
-		}
-		close ($fh);
+	    my $new_pkg_display_content = $tar->get_content ('+DISPLAY');
+	    if (defined $new_pkg_display_content) {
+		my $ctx = Digest::SHA->new(256);
+		$ctx=>add ($new_pkg_display_content);
+		$new_pkg_display_hash = $ctx->sha256_base64;
+	    }
+	    if (defined $new_pkg_display_hash &&
+		(!defined $old_pkg_display_hash || $old_pkg_display_hash ne $new_pkg_display_hash)) {
+		print $new_pkg_display_content;
+	    }
+	    elsif ($debug_flag) {
+		print "DEBUG: +DISPLAY content matches old version. Suppressing output.\n";
 	    }
 	}
 	return 1;
@@ -1071,6 +1086,26 @@ sub older_package_installed {
 
     print "DEBUG: No older package found.\n" if ($debug_flag);
     return 0;
+}
+
+# Return file hash of existing package's +DISPLAY file, if it exists.
+# (If I build more minimal_pkg functionality, the beginning of
+# minimal_pkg_delete should be pulled out into a separate subroutine
+# to obtain the +CONTENTS info, and get the file hash for this purpose
+# from that location instead of computing it separately.
+sub get_pkg_display_hash {
+    my ($pkg) = @_;
+    my $display_path = "$PKG_DIR/$pkg/+DISPLAY";
+
+    return undef unless (-f $display_path && -r $display_path);
+
+    if (open (my $fh, '<', $display_path)) {
+        my $ctx = Digest::SHA->new(256);
+        $ctx->addfile($fh);
+        close ($fh);
+        return $ctx->sha256_base64;
+    }
+    return undef;
 }
 
 # Delete a package.
