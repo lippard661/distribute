@@ -124,7 +124,11 @@
 # Modified 29 June 2026 by Jim Lippard to only print contents of +DISPLAY for
 #    a package install if it's a new install or the contents have changed from
 #    the previously installed version.
-
+# Modified 30 June 2026 by Jim Lippard after Claude Opus 4.8 review to fix several bugs:
+#    fixed +DISPLAY block (undeclared var, ->add typo), version_gt vN comparison (also
+#    fixed in distribute.pl) macOS/@sample absolute-path dir creation, syslock re-lock
+#    on die (END + signal handlers), regex metachar quoting, OpenBSD version-parse
+#    fallback, and effective-UID privilege check.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -150,7 +154,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.4 of 29 June 2026.';
+my $VERSION = 'install.pl version 1.5 of 30 June 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -203,12 +207,20 @@ my $current_openbsd;
 
 if ($^O eq 'openbsd') {
     $current_openbsd = `$UNAME -a`;
-    $current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
-    $current_openbsd--;
+    # Works so long as OpenBSD continues to use single-digit minor version numbers only.
+    if ($current_openbsd =~ /^OpenBSD \S+ (\d+)\.(\d+) /) {
+	$current_openbsd = "$1$2";
+	$current_openbsd--;
+    }
+    else {
+	chomp (my $u = $current_openbsd);
+	die "Cannot identify current OpenBSD version from uname. $u\n";
+    }   
 }
 else {
     $current_openbsd = 'not-openbsd';
 }
+
 my $OPENBSD_MIN_VERSION = "$current_openbsd";
 
 my $THREE_SPACES = '   ';
@@ -257,12 +269,18 @@ if ($#ARGV != -1) {
     die "Usage: install.pl [-f (force)|-n (no syslock)|-V (version)|-d debug]\n";
 }
 
+# Set up signal handlers to force re-locking END block.
+$SIG{INT} = $SIG{TERM} = sub { die "Caught SIG$_[0], aborting.\n" };
+
 # Die if weird characters in domain name.
 die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
 
-# Get user.
-$user = getpwuid($<);
-die "Error. Must be run by root.\n" if ($user ne 'root');
+# Die if non-root
+die "Error. Must be run by root.\n" if ($> != 0);
+
+# username for the CHANGELOG entry, captured before pledge so we don't
+# need the 'getpw' promise later
+$user = getpwuid($>);
 
 # If no syslock or config file, don't use syslock.
 if (!-e $SYSLOCK || !-e $SYSLOCK_CONF) {
@@ -472,7 +490,7 @@ if ($use_syslock) {
 
 # Create temp dir. Needed for signature verification and for altering
 # package +CONTENTS files for minimal_pkg_add.
-$temp_dir = mkdtemp ('/tmp/install.XXXXXXX');
+$temp_dir = mkdtemp ('/tmp/install.XXXXXXX') || die "Could not create temp dir. $!\n";
 chomp ($temp_dir);
 
 # For each file in the install dir:
@@ -481,7 +499,7 @@ chomp ($temp_dir);
 # If it is of the form <name>-<version>.tgz or <name>-<version>-no_xxx.tgz:
 #    Install using pkg_add.
 foreach $file (@files) {
-    if ($file =~ /^$host-\d+-\d+-package\.tgz$/) {
+    if ($file =~ /^\Q$host\E-\d+-\d+-package\.tgz$/) {
 	@contents = verify_and_extract_package ("$INSTALL_DIR/$file");
 	# Remove file and create CHANGELOG entry if successfully installed.
 	if ($contents[0]) {
@@ -540,16 +558,22 @@ close ($fh);
 
 ### Subroutines.
 
+# End block to ensure groups are relocked in cases where syslock dies while they're locked
+# Signal handler for INT and TERM catches edge cases.
+END {
+    relock_groups() if ($use_syslock && %unlocked_by_us);
+}
+
 # Subroutine to relock syslock groups.
 sub relock_groups {
     foreach my $syslock_group (@SYSLOCK_GROUPS) {
-        if ($unlocked_by_us{$syslock_group}) {
+        if (delete $unlocked_by_us{$syslock_group}) { # delete makes this one-shot, calling twice is no-op
             print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
             system ($SYSLOCK, '-g', $syslock_group);
         }
-        else {
-            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
-        }
+#        else {
+#            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
+#        }
     }
 }
 
@@ -633,7 +657,7 @@ sub minimal_pkg_add {
 	    print "No \"\@comment\" PLIST found in +CONTENTS file for $file.\n";
 	    return 0;
 	}
-	if ($content !~ /^\@name $file_minus_tgz/m) {
+	if ($content !~ /^\@name \Q$file_minus_tgz\E$/m) {
 	    print "No \"\@name $file_minus_tgz\" found in +CONTENTS file for $file.\n";
 	    return 0;
 	}
@@ -657,7 +681,8 @@ sub minimal_pkg_add {
 
     if (!-e $PKG_DIR) {
 	print "DEBUG: creating $PKG_DIR\n" if ($debug_flag);
-	if (!make_path ("$PKG_DIR")) {
+	make_path ($PKG_DIR, { error => \my $err });
+	if (@$err) {
 	    print "Couldn't create $PKG_DIR. $!\n";
 	    return 0; # didn't get to installation
 	}
@@ -694,6 +719,13 @@ sub minimal_pkg_add {
 
     foreach $line (@lines) {
 	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
+	    # Content lines are relative to @cwd (verified /usr/local above);
+	    # an absolute path here is malformed. Reject before classifying.
+	    # NB: the macOS /Library/Perl path is *derived* by the substitution
+	    # below from a relative content line, so it never passes through here.
+	    if ($line =~ m{^/}) {
+		die "Aborting due to absolute path in $file +CONTENTS. $line\n";
+	    }
 	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
 		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$line");
 		$dir_mode{$line} = $current_mode;
@@ -769,20 +801,24 @@ sub minimal_pkg_add {
     chdir ($DIR_PREFIX);
     $tar->setcwd ( cwd() );
 
+    # Two cases where dirs to create are absolute paths: $MACOS_PERL and @sample dirs.
     print "DEBUG: creating any required directories\n" if ($debug_flag);
     print "DEBUG: \@dirs_to_create = @dirs_to_create\n" if ($debug_flag);
     foreach $dir (@dirs_to_create) {
-	if (!make_path ("$DIR_PREFIX/$dir")) {
-	    print "Couldn't create required directory. $! $DIR_PREFIX/$dir\n";
+	# Absolute paths (macOS perl modules under /Library/Perl, @sample dirs
+	# under /etc) are used as-is; relative paths live under /usr/local.
+	my $full_path = ($dir =~ m{^/}) ? $dir : "$DIR_PREFIX/$dir";
+	make_path ($full_path, { error => \my $err });
+	if (@$err) {
+	    print "Couldn't create required directory. $! $full_path\n";
 	    return 0;
 	}
 	elsif ($debug_flag) {
-	    print "DEBUG: created dir $dir (and any missing intermediates)\n";
+	    print "DEBUG: created dir $full_path (and any missing intermediates)\n";
 	}
 	
 	# Set mode on directory if we have one recorded
 	if (defined($dir_mode{$dir})) {
-	    my $full_path = "$DIR_PREFIX/$dir";
 	    if (!chmod($dir_mode{$dir}, $full_path)) {
 		print "DEBUG: could not set mode " . sprintf("%04o", $dir_mode{$dir}) . " on directory $full_path. $!\n" if ($debug_flag);
 	    }
@@ -936,9 +972,10 @@ sub minimal_pkg_add {
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
 	    my $new_pkg_display_content = $tar->get_content ('+DISPLAY');
+	    my $new_pkg_display_hash;
 	    if (defined $new_pkg_display_content) {
 		my $ctx = Digest::SHA->new(256);
-		$ctx=>add ($new_pkg_display_content);
+		$ctx->add ($new_pkg_display_content);
 		$new_pkg_display_hash = $ctx->sha256_base64;
 	    }
 	    if (defined $new_pkg_display_hash &&
@@ -1052,9 +1089,9 @@ sub older_package_installed {
 	return 0;
     }
 
-    if (opendir (DIR, $PKG_DIR)) {
-	@files = grep (!/^\.{1,2}$/, readdir (DIR));
-	closedir (DIR);
+    if (opendir ($dir_fh, $PKG_DIR)) {
+	@files = grep (!/^\.{1,2}$/, readdir ($dir_fh));
+	closedir ($dir_fh);
     }
     else {
 	print "Cannot open dir $PKG_DIR. $!\n";
@@ -1063,7 +1100,7 @@ sub older_package_installed {
 
     foreach $check_file (@files) {
 	# Might have an older version here.
-	if ($check_file =~ /^$file_minus_version-(\d.*)$/) {
+	if ($check_file =~ /^\Q$file_minus_version\E-(\d.*)$/) {
 	    $check_version = $1;
 	    if ($check_version =~ /^(.*)-(no_\w+)$/) {
 		$check_no_suffix = $1;
@@ -1633,15 +1670,15 @@ sub version_gt {
     if (defined($v1_vv) || defined($v2_vv)) {
         my $e1 = $v1_vv // '';
         my $e2 = $v2_vv // '';
-        
-        # If both are epoch format (vN), compare numerically
-        if ($e1 =~ /^v(\d+)$/ && $e2 =~ /^v(\d+)$/) {
-            my $n1 = $1;
-            $e2 =~ /^v(\d+)$/;
-            my $n2 = $1;
-            return 1 if ($n1 > $n2);
-            return 0 if ($n1 < $n2);
-        }
+
+	my ($n1) = $e1 =~ /^v(\d+)$/;
+	my ($n2) = $e2 =~ /^v(\d+)$/;
+
+	# If both are epoch format (vN), compare numerically
+	if (defined $n1 && defined $n2) {
+	    return 1 if ($n1 > $n2);
+	    return 0 if ($n1 < $n2);
+	}
         # If both are alpha (single letters), string comparison works
         elsif ($e1 =~ /^[a-o]$/ && $e2 =~ /^[a-o]$/) {
             return 1 if ($e1 gt $e2);
@@ -1688,7 +1725,7 @@ sub version_parse {
     $portrevision = -1; # if not found
 
     # maj.min.pat(pN)(vN)
-    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)*(v\d+)*$/) {
+    if ($version =~ /^(\d+)\.(\d+)\.(\d+)(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -1696,14 +1733,14 @@ sub version_parse {
 	$v_epoch = $5 if (defined ($5));
     }
     # maj.min(alpha)(pN) (reportnew, py3-packaging)
-    elsif ($version =~ /^(\d+)\.(\d+)([a-o])*(p\d+)*$/) {
+    elsif ($version =~ /^(\d+)\.(\d+)([a-o])?(p\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$v_epoch = $3 if (defined ($3));
 	$portrevision = $4 if (defined ($4));
     }
     # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
-    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]*)(p\d+)*(v\d+)*$/) {
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]?)(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -1717,7 +1754,7 @@ sub version_parse {
 	$v_epoch = $6 if (defined ($6));
     }
     # maj.min.yyyymmdd(pN)(vN) (wireguard-tools)
-    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)*(v\d+)*$/) {
+    elsif ($version =~ /^(\d+)\.(\d+)\.(\d{8})(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;

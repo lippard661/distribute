@@ -119,6 +119,11 @@
 #    also fail fast.
 # Modified 8 June 2026 by Claude at the direction of Jim Lippard to generate
 #    syslock grp files if needed by packages.
+# Modified 30 June 2026 by Jim Lippard to fix comparison bug in version_gt and
+#    OpenBSD version-parse fallbackfound by Claude Opus 4.8 in install.pl. Also
+#    fixed other issues found here: new-IP-address range validation, %s->%S
+#    timestamp in package name, add_files partial-failure check, passphrase/temp
+#    file cleanup via END block, regex metachar quoting.
 
 use strict;
 use warnings;
@@ -136,8 +141,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-
-my $VERSION = 'distribute.pl version 1.3 of 8 June 2026.';
+my $VERSION = 'distribute.pl version 1.4 of 30 June 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -181,11 +185,20 @@ my $PRIOR_SIGNIFY_PUB_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.pub";
 my $SIGNIFY_KEY_NEXT_NAME = "$DOMAINNAME-$next_year-pkg";
 my $SIGNIFY_PUB_KEY_NEXT = "$SIGNIFY_PUB_KEY_DIR/$SIGNIFY_KEY_NEXT_NAME.pub";
 my $SIGNIFY_MIN_YEAR = $prev_year;
+
 my $current_openbsd;
+
 if ($^O eq 'openbsd') {
     $current_openbsd = `$UNAME -a`;
-    $current_openbsd =~ s/^OpenBSD [\w\.]+ (\d+)\.(\d+) .*$/$1$2/;
-    $current_openbsd--;
+    # Works so long as OpenBSD continues to use single-digit minor version numbers only.
+    if ($current_openbsd =~ /^OpenBSD \S+ (\d+)\.(\d+) /) {
+	$current_openbsd = "$1$2";
+	$current_openbsd--;
+    }
+    else {
+	chomp (my $u = $current_openbsd);
+	die "Cannot identify current OpenBSD version from uname. $u\n";
+    }   
 }
 else {
     $current_openbsd = 'not-openbsd';
@@ -229,6 +242,9 @@ my %syslock_groups;
 
 # Signify errors.
 my @errors;
+
+# End block to clean up temp files and wipe passphrase from memory if used.
+END { cleanup(); }
 
 ### Main program.
 
@@ -386,7 +402,7 @@ if ($opts{'h'}) {
 }
 
 # Get the date (YYMMDD-HHMMSS).
-$date = strftime ("%Y%m%d-%H%M%s", localtime (time()));
+$date = strftime ("%Y%m%d-%H%M%S", localtime (time()));
 print "DEBUG: getting date: $date\n" if ($debug_flag);
 
 # Warn about missing next year signing key if month is December.
@@ -622,12 +638,6 @@ foreach $host (keys (%host_package_files)) {
     }
 }
 
-# Wipe $signify_passphrase from memory if used.
-if (defined ($signify_passphrase)) {
-    $signify_passphrase = "x" x length ($signify_passphrase); # overwrite memory
-    $signify_passphrase = '';
-}
-
 # Now actually distribute the packages to the destinations.
 # Instead of doing one at a time we could ship all at once, which
 # might be a lot nicer. Would need to find all the matches and add
@@ -638,7 +648,7 @@ my @failed_hosts;
 foreach $host (keys (%host_package_path)) {
     @rsync_file_list = ();
     foreach $package_path (@files_to_ship_and_remove) {
-	if ($package_path =~ /^\/var\/install\/$host\//) {
+	if ($package_path =~ m{^\Q$INSTALL_DIR\E/\Q$host\E/}) {
 	    push (@rsync_file_list, $package_path);
 	    # With rsync_wrapper.sh	    
 	    # system ("$RSYNC --rsync-path=/usr/local/sbin/rsync_wrapper.sh -avr $package_path $host-rsnapshot:/var/install/");
@@ -693,6 +703,15 @@ exit 0;
 
 ### Subroutines.
 
+# Cleanup, called from END block.
+sub cleanup {
+    if (defined ($signify_passphrase)) {
+	$signify_passphrase = "x" x length ($signify_passphrase); # overwrite memory
+	$signify_passphrase = '';
+    }
+    rmtree($temp_dir) if (defined $temp_dir && -d $temp_dir);
+}
+
 # Subroutine to parse config file.
 sub parse_config {
     my ($config_file) = @_;
@@ -726,7 +745,7 @@ sub parse_config {
 	    $macros{$field} = $value;
 	    $have_macros = 1;
 	}
-	elsif (/\s*([\w\-]+):\s*(.*)$/) {
+	elsif (/^\s*([\w\-]+):\s*(.*)$/) {
 	    $field = $1;
 	    $value = $2;
 
@@ -941,12 +960,12 @@ sub find_package {
 	die "Error in config. Package filename doesn't end in \"-PKG\". $pkg_start\n";
     }
 
-    opendir (DIR, $pkg_dir) || die "Could not open directory $pkg_dir. $!\n";
-    @files = grep (!/^\.{1,2}$/, readdir (DIR));
-    closedir (DIR);
+    opendir (my $dir_fh, $pkg_dir) || die "Could not open directory $pkg_dir. $!\n";
+    @files = grep (!/^\.{1,2}$/, readdir ($dir_fh));
+    closedir ($dir_fh);
 
     foreach $file (@files) {
-	if ($file =~ /^$pkg_start-([\w\.]+)\.tgz$/ || $file =~ /^$pkg_start-([\w\.]+-no_[\w]+)\.tgz$/) {
+	if ($file =~ /^\Q$pkg_start\E-([\w\.]+)\.tgz$/ || $file =~ /^\Q$pkg_start\E-([\w\.]+-no_[\w]+)\.tgz$/) {
 	    # This currently matches python-tkinter-xxx and not just
 	    # python-xxx. Is it safe to restrict $1 to numbers, letters,
 	    # and periods, and exclude hyphens? i.e., ([\w\.]+)
@@ -988,15 +1007,15 @@ sub version_gt {
     if (defined($v1_vv) || defined($v2_vv)) {
         my $e1 = $v1_vv // '';
         my $e2 = $v2_vv // '';
-        
-        # If both are epoch format (vN), compare numerically
-        if ($e1 =~ /^v(\d+)$/ && $e2 =~ /^v(\d+)$/) {
-            my $n1 = $1;
-            $e2 =~ /^v(\d+)$/;
-            my $n2 = $1;
-            return 1 if ($n1 > $n2);
-            return 0 if ($n1 < $n2);
-        }
+
+	my ($n1) = $e1 =~ /^v(\d+)$/;
+	my ($n2) = $e2 =~ /^v(\d+)$/;
+
+	# If both are epoch format (vN), compare numerically
+	if (defined $n1 && defined $n2) {
+	    return 1 if ($n1 > $n2);
+	    return 0 if ($n1 < $n2);
+	}
         # If both are alpha (single letters), string comparison works
         elsif ($e1 =~ /^[a-o]$/ && $e2 =~ /^[a-o]$/) {
             return 1 if ($e1 gt $e2);
@@ -1100,7 +1119,7 @@ sub get_signify_passphrase {
     $signify_passphrase = <STDIN>;
     system ($STTY, 'echo');
     print "\n"; # newline after silent input
-    chomp ($signify_passphrase);
+    chomp ($signify_passphrase) if (defined ($signify_passphrase));
     return ($signify_passphrase);
 }
 
@@ -1139,7 +1158,12 @@ sub create_package {
     # STDERR to /dev/null to avoid the error message about stripping the initial /.
     # The module won't extract with a leading slash so we need to remove them.
     my $tar = Archive::Tar->new;
-    $tar->add_files (@file_list);
+    my @added = $tar->add_files (@file_list);
+    if (@added != @file_list) {
+	die "Failed to add all files to package for $host: got "
+	    . scalar(@added) . " of " . scalar(@file_list)
+	    . ". " . $tar->error . "\n";
+    }
     foreach $file (@file_list) {
 	$file_wo_slash = $file;
 	$file_wo_slash =~ s/^\///;
@@ -1359,8 +1383,8 @@ sub _custom_get_old_and_new_ip_addresses {
     	  print "New IP Address: ";
     	  $new_address = <STDIN>;
     	  chomp ($new_address);
-	  $new_address = 'null' if ($new_address !~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-				    && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);
+	  $new_address = 'null' unless ($new_address =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+                            && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);	  
     }
     
     return ($old_address, $new_address, $new_rsync_host_suffix);
