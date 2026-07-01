@@ -129,6 +129,7 @@
 #    fixed in distribute.pl) macOS/@sample absolute-path dir creation, syslock re-lock
 #    on die (END + signal handlers), regex metachar quoting, OpenBSD version-parse
 #    fallback, and effective-UID privilege check.
+# Modified 1 July 2026 by Jim Lippard to fix +DISPLAY hash calculation.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -154,7 +155,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.5 of 30 June 2026.';
+my $VERSION = 'install.pl version 1.5a of 1 July 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -972,12 +973,7 @@ sub minimal_pkg_add {
 	if ($tar->contains_file('+DISPLAY')) {
 	    $tar->extract_file('+DISPLAY', "$PKG_DIR/$file_minus_tgz/+DISPLAY");
 	    my $new_pkg_display_content = $tar->get_content ('+DISPLAY');
-	    my $new_pkg_display_hash;
-	    if (defined $new_pkg_display_content) {
-		my $ctx = Digest::SHA->new(256);
-		$ctx->add ($new_pkg_display_content);
-		$new_pkg_display_hash = $ctx->sha256_base64;
-	    }
+	    my $new_pkg_display_hash = get_pkg_display_hash ($file_minus_tgz);
 	    if (defined $new_pkg_display_hash &&
 		(!defined $old_pkg_display_hash || $old_pkg_display_hash ne $new_pkg_display_hash)) {
 		print $new_pkg_display_content;

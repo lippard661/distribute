@@ -7,6 +7,8 @@
 # Modified 4 January 2026 by Jim Lippard to remove & on subroutine calls.
 # Modified 2 May 2026 by Jim Lippard for minor improvements.
 # Modified 17 May 2026 by Jim Lippard to not use bareword filehandles.
+# Modified 1 July 2026 by Jim Lippard after Claude Opus 4.8 review to
+#    fix minor issues and make error checking more robust.
 
 use strict;
 use warnings;
@@ -37,9 +39,9 @@ foreach $package (@found_packages) {
 sub get_all_packages {
     my (@all_packages);
 
-    opendir (DIR, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
-    @all_packages = grep (!/^\.{1,2}/, readdir (DIR));
-    closedir (DIR);
+    opendir (my $dir_fh, $PKG_DIR) || die "Cannot open $PKG_DIR for reading file list. $!\n";
+    @all_packages = grep { !/^\.{1,2}$/ && -d "$PKG_DIR/$_" } readdir ($dir_fh);
+    closedir ($dir_fh);
 
     return (@all_packages);
 }
@@ -69,7 +71,8 @@ sub list_all_brief {
     closedir ($dir_fh);
 
     foreach $package (sort @all_packages) {
-	$package_name = 0;
+	next unless (-d "$PKG_DIR/$package");
+	$package_name = '';
 	my $pkg_fh;
 	if (!open ($pkg_fh, '<', "$PKG_DIR/$package/+CONTENTS")) {
 	    warn "Skipping $package: Cannot open +CONTENTS. $!\n";
@@ -82,8 +85,12 @@ sub list_all_brief {
 	}
 	close ($pkg_fh);
 	die "Cannot find \"\@name\" in +CONTENTS for package $package.\n" unless (defined ($package_name) && length ($package_name) > 0);
-	
-	open (my $desc_fh, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
+
+	my $desc_fh;
+	if (!open ($desc_fh, '<', "$PKG_DIR/$package/+DESC")) {
+	    warn "Skipping $package: Cannot open +DESC. $!\n";
+	    next;
+	}
 	$one_liner = <$desc_fh>;
 	$one_liner = '' unless defined ($one_liner);
 	chomp ($one_liner);
@@ -96,9 +103,14 @@ sub list_all_brief {
 sub show_package_desc {
     my ($package) = @_;
     my ($one_liner);
-    
+
+    unless (-d "$PKG_DIR/$package") {
+        warn "Skipping $package: not a package directory.\n";
+        return;
+    }
     open (my $fh, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
     $one_liner = <$fh>;
+    $one_liner = '' unless defined ($one_liner);
     chomp ($one_liner);
     print "Information for inst:$package\n\n";
     print "Comment:\n$one_liner\n\nDescription:\n";
