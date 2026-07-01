@@ -10,6 +10,8 @@
 #    remove tmppath pledge.
 # Modified 18 May 2026 by Jim Lippard to remove bareword filehandles, only use
 #    pledge/unveil on OpenBSD, and reject non-commented lines after Gemini review.
+# Modiied 1 July 2026 by Jim Lippard for some minor cleanup after Claude
+#    Opus 4.8 review.
 
 use strict;
 use warnings;
@@ -31,14 +33,18 @@ my $CONFIG_FILE = '/etc/doas.conf';
 my $BACKUP_CONFIG_FILE = '/etc/doas.conf.bak';
 
 my (%options, $output_file, $another_host, $hostname, $user, $date, $temp_dir, $host_match,
-    $all_except, $host_list, @host_array, $continuation_line);
+    $all_except, $host_list, @host_array);
+my $continuation_line = 0;
+
+# END block to cleanup temp files.
+END { if (defined $temp_dir && -d $temp_dir) { unlink "$temp_dir/$OUTPUT_FILE"; rmdir $temp_dir; } }
 
 # Use: gendoas.pl [-V|-o output file] [host]
 
 getopts ('Vo:', \%options) || exit;
 
 if ($options{'V'}) {
-    print "gendoas.pl version 1.4 of 18 May 2026\n";
+    print "gendoas.pl version 1.5 of 1 July 2026\n";
     exit;
 }
 
@@ -68,8 +74,8 @@ if ($^O eq 'openbsd') {
 
     unveil ($TEMPLATE, 'r');
     unveil ('/tmp', 'rwc');
-    unveil (dirname ($output_file), 'rwc');
-    unveil ($output_file, 'rwc');
+    unveil ($abs_dir, 'rwc');
+    unveil ($abs_output, 'rwc');
     if (!$another_host) {
 	# Need to create or overwrite the doas.conf on this host.
 	unveil ('/etc', 'rwc');
@@ -135,15 +141,17 @@ while (<$template_fh>) {
 	    print $output_fh "$1\n" if ($host_match);
 	}
 	else {
-	    die "Template error at line $.: continuation line is not commented: $_";
+	    chomp(my $line = $_);
+	    die "Template error at line $.: continuation line is not commented: $line";
 	}
     }
-        elsif (/^\s*#/ || /^\s*$/) {
+    elsif (/^\s*#/ || /^\s*$/) {
         # Comment or blank line - pass through if host_match
         print $output_fh "$_" if ($host_match);
     }
     else {
-        die "Template error at line $.: line is not commented: $_";
+	chomp(my $line = $_);
+        die "Template error at line $.: line is not commented: $line";
     }
 }
 close ($output_fh);
@@ -164,6 +172,4 @@ else {
 	|| die "Cannot rename new file over old file: $!\n";
 }
 
-# Remove temp file and temp dir.
-unlink ("$temp_dir/$OUTPUT_FILE");
-rmdir ($temp_dir);
+# Remove temp file and temp dir (done by END block above).
