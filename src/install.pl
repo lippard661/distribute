@@ -129,7 +129,8 @@
 #    fixed in distribute.pl) macOS/@sample absolute-path dir creation, syslock re-lock
 #    on die (END + signal handlers), regex metachar quoting, OpenBSD version-parse
 #    fallback, and effective-UID privilege check.
-# Modified 1 July 2026 by Jim Lippard to fix +DISPLAY hash calculation.
+# Modified 2 July 2026 by Jim Lippard to fix +DISPLAY hash calculation (and same
+#    issue for sample config file check).
 use strict;
 use warnings;
 use Archive::Tar;
@@ -155,7 +156,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.5a of 1 July 2026.';
+my $VERSION = 'install.pl version 1.5a of 2 July 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -1085,7 +1086,7 @@ sub older_package_installed {
 	return 0;
     }
 
-    if (opendir ($dir_fh, $PKG_DIR)) {
+    if (opendir (my $dir_fh, $PKG_DIR)) {
 	@files = grep (!/^\.{1,2}$/, readdir ($dir_fh));
 	closedir ($dir_fh);
     }
@@ -1136,7 +1137,7 @@ sub get_pkg_display_hash {
         my $ctx = Digest::SHA->new(256);
         $ctx->addfile($fh);
         close ($fh);
-        return $ctx->sha256_base64;
+        return $ctx->b64digest;
     }
     return undef;
 }
@@ -1335,7 +1336,7 @@ sub minimal_pkg_delete {
 		    $ctx->addfile($fh);
 		    close ($fh);
 		
-		    $check_sha = $ctx->sha256_base64;
+		    $check_sha = $ctx->b64digest;
 		    while (length($check_sha) % 4) { # manually add padding
 			$check_sha .= '=';
 		    }
