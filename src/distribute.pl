@@ -129,6 +129,9 @@
 #    host distributing is from, by building the packages in the
 #    /var/install/<hostname> dir and then leaving them there. Modified
 #    install.pl to prefer that directory if present.
+#    Reject new IP address that's the same as old IP address, skip
+#    file updates for ip-address that don't change for a particular
+#    host.
 
 use strict;
 use warnings;
@@ -1328,7 +1331,13 @@ sub _custom_ip_address {
 		    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
 
 		# Update the file by changing the IP addresses.
-		_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address, 1); # also replace dot-escaped IPs
+		my $changed = _custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address, 1); # also replace dot-escaped IPs
+
+		if (!$changed) {
+		    warn "No IP substitutions in $dest_path for $host; skipping (no-op for this host).\n";
+		    unlink ("$temp_dir/$host/$dest_path");
+		    next; # skip this host for this file
+		}
 
 		# Manually remove g and o read permissions.
 		# This must occur AFTER the call to _custom_global_replace_in_file,
@@ -1419,7 +1428,11 @@ sub _custom_get_old_and_new_ip_addresses {
     	  $new_address = <STDIN>;
     	  chomp ($new_address);
 	  $new_address = 'null' unless ($new_address =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-                            && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);	  
+					&& $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);
+	  if ($new_address eq $old_address) {
+	      print "New address $new_address is the same as old address $old_address. Try again.\n";
+	      $new_address = 'null';
+	  }
     }
     
     return ($old_address, $new_address, $new_rsync_host_suffix);
@@ -1468,14 +1481,16 @@ sub _custom_global_replace_in_file {
     rename ($file, $backup_file) || die "Cannot rename $file to $backup_file. $!\n";
     open (my $infile_fh, '<', $backup_file) || die "Cannot open file. $backup_file $!\n";
     open (my $outfile_fh, '>', $file) || die "Cannot open file for writing. $file $!\n";
+    my $changed = 0;
     while (<$infile_fh>) {
-	s/\Q$string\E/$replace/g;
-	s/\Q$dot_escaped_string\E/$dot_escaped_replace/g if ($dot_escape);
+	$changed += s/\Q$string\E/$replace/g;
+	$changed += s/\Q$dot_escaped_string\E/$dot_escaped_replace/g if ($dot_escape);
 	print $outfile_fh $_;
     }
     close ($infile_fh);
     close ($outfile_fh);
     unlink ($backup_file);
+    return ($changed); # did anything change?
 }
 
 ### End custom packages.
