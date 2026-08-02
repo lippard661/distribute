@@ -119,11 +119,16 @@
 #    also fail fast.
 # Modified 8 June 2026 by Claude at the direction of Jim Lippard to generate
 #    syslock grp files if needed by packages.
-# Modified 30 June 2026 by Jim Lippard to fix comparison bug in version_gt and
-#    OpenBSD version-parse fallbackfound by Claude Opus 4.8 in install.pl. Also
-#    fixed other issues found here: new-IP-address range validation, %s->%S
-#    timestamp in package name, add_files partial-failure check, passphrase/temp
-#    file cleanup via END block, regex metachar quoting.
+# Modified 30 June 2026 by Jim Lippard to fix comparison bug in version_gt
+#    and OpenBSD version-parse fallbackfound by Claude Opus 4.8 in
+#    install.pl. Also fixed other issues found here: new-IP-address range
+#    validation, %s->%S timestamp in package name, add_files partial-failure
+#    check, passphrase/temp file cleanup via END block, regex metachar
+#    quoting.
+# Modified 1 August 2026 by Jim Lippard to allow distributing to the same
+#    host distributing is from, by building the packages in the
+#    /var/install/<hostname> dir and then leaving them there. Modified
+#    install.pl to prefer that directory if present.
 
 use strict;
 use warnings;
@@ -131,6 +136,7 @@ use Archive::Tar;
 use File::Basename qw(basename dirname fileparse);
 use File::Copy qw(copy cp);
 use File::Path qw(rmtree);
+use File::Spec;
 use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp );
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
@@ -141,7 +147,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.4 of 30 June 2026.';
+my $VERSION = 'distribute.pl version 1.5 of 1 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -173,6 +179,7 @@ my $HOSTNAME = hostname();
 my (@HOSTNAME_ARRAY) = split (/\./, $HOSTNAME);
 my $DOMAINNAME = pop (@HOSTNAME_ARRAY);
 $DOMAINNAME = pop (@HOSTNAME_ARRAY) . '.' . $DOMAINNAME;
+my $SHORT_HOSTNAME = shift (@HOSTNAME_ARRAY);
 
 my $SIGNIFY_PUB_KEY_DIR = '/etc/signify';
 my $SIGNIFY_KEY_NAME = "$DOMAINNAME-$year-pkg";
@@ -305,6 +312,12 @@ $debug_flag = $opts{'d'};
 if ($#ARGV == -1) {
     die "Usage: distribute.pl [-4|-6|-p (prior year key)|-V (version)|-c config|-h hosts(CSV)|-k key|-d debug] [files]\n";
 }
+
+# Complain about invalid domain name or short hostname (like install.pl).
+# Die if weird characters in domain name.
+die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
+# Die if weird characters in short host name.
+die "Invalid host name: $SHORT_HOSTNAME\n" unless ($SHORT_HOSTNAME =~ /^[\w.-]+$/);
 
 # Parse config file.
 print "DEBUG: parsing config file $config_file\n" if ($debug_flag);
@@ -485,6 +498,23 @@ foreach $file (@files) {
 	push (@process_hosts, $host);
     }
 
+    # In-place plain files are no-op for distribution to the local host.
+    if ($CONFIG{$file}{TYPE} eq 'plain') {
+	my $src = File::Spec->canonpath($CONFIG{$file}{FILE});
+	my $dst = File::Spec->canonpath($CONFIG{$file}{DEST} // $CONFIG{$file}{FILE});
+	if ($src eq $dst && grep { $_ eq $SHORT_HOSTNAME } @process_hosts) {
+	    warn "Skipping local host $SHORT_HOSTNAME for $file: "
+		. "file and dest are identical ($src) -- no-op.\n";
+	    @process_hosts = grep { $_ ne $SHORT_HOSTNAME } @process_hosts;
+	    
+	    # If that emptied the list, nothing to build/ship for this file.
+	    if (!@process_hosts) {
+		warn "No remaining hosts for $file after local no-op removal; skipping.\n";
+		next;
+	    }
+	}
+    }
+
     # Complain/die if -h selected no hosts.
     die "No selected hosts match for file $file. @selected_hosts\n" if ($host_option && @process_hosts == 0);
     
@@ -659,37 +689,42 @@ foreach $host (keys (%host_package_path)) {
 	warn "No files to distribute to $host.\n";
 	next;
     }
-    print "Distributing to $host.\n";
-    my $rc = system ($RSYNC, '-avr', @rsync_file_list, "$host$rsync_host_suffix:.");
-    if ($rc == -1) {
-	warn "Failed to execute rsync for $host: $!\n";
-	$had_errors = 1;
+    if ($host eq $SHORT_HOSTNAME) {
+	# Skip the rsync and removal; the files are already where they're
+	# supposed to be.
+	print "Distributed to local host $host.\n";
     }
-    elsif ($rc & 127) {
-	warn sprintf("rsync for %s died with signal %d\n",
-		     $host, ($rc & 127));
-	$had_errors = 1;
+    else {
+	print "Distributing to $host.\n";
+	my $rc = system ($RSYNC, '-avr', @rsync_file_list, "$host$rsync_host_suffix:.");
+	if ($rc == -1) {
+	    warn "Failed to execute rsync for $host: $!\n";
+	    $had_errors = 1;
+	}
+	elsif ($rc & 127) {
+	    warn sprintf("rsync for %s died with signal %d\n",
+			 $host, ($rc & 127));
+	    $had_errors = 1;
+	}
+	elsif (($rc >> 8) != 0) {
+	    warn sprintf("rsync for %s exited with status %d\n",
+			 $host, ($rc >> 8));
+	    $had_errors = 1;
+	}
+	push (@failed_hosts, $host) if ($rc != 0);
     }
-    elsif (($rc >> 8) != 0) {
-	warn sprintf("rsync for %s exited with status %d\n",
-		     $host, ($rc >> 8));
-	$had_errors = 1;
-    }
-    push (@failed_hosts, $host) if ($rc != 0);
-}
 
-# Now clean it all up and delete them.
-foreach $file (@files_to_ship_and_remove) {
-    unlink ($file);
+
+    if ($host ne $SHORT_HOSTNAME) {
+	# Now clean it all up and delete them.
+	foreach $file (@rsync_file_list) {
+	    unlink ($file);
+	}
+    }
 }
 
 # Exit temp subdir, but stay in /tmp.
 chdir ('/tmp');
-
-# Remove the fake dirs if we're done with them. (Superfluous.)
-#if ($have_fake_dir) {
-#    rmtree ("$temp_dir/$file");
-#}
 
 # Delete temp dir.
 rmtree ($temp_dir);
@@ -1293,7 +1328,7 @@ sub _custom_ip_address {
 		    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
 
 		# Update the file by changing the IP addresses.
-		_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address);
+		_custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address, 1); # also replace dot-escaped IPs
 
 		# Manually remove g and o read permissions.
 		# This must occur AFTER the call to _custom_global_replace_in_file,
@@ -1414,8 +1449,19 @@ sub _get_wan_ip {
 
 # Subroutine to do global string replacement on a given file.
 sub _custom_global_replace_in_file {
-    my ($file, $string, $replace) = @_;
+    my ($file, $string, $replace, $dot_escape) = @_;
     my $backup_file;
+    my ($dot_escaped_string, $dot_escaped_replace);
+
+    if (defined ($dot_escape) && $dot_escape) {
+	$dot_escaped_string = $string;
+	$dot_escaped_string =~ s/\./\\./g;
+	$dot_escaped_replace = $replace;
+	$dot_escaped_replace =~ s/\./\\./g;
+    }
+    else {
+	$dot_escape = 0;
+    }
 
     $backup_file = $file . '.bak';
 
@@ -1424,6 +1470,7 @@ sub _custom_global_replace_in_file {
     open (my $outfile_fh, '>', $file) || die "Cannot open file for writing. $file $!\n";
     while (<$infile_fh>) {
 	s/\Q$string\E/$replace/g;
+	s/\Q$dot_escaped_string\E/$dot_escaped_replace/g if ($dot_escape);
 	print $outfile_fh $_;
     }
     close ($infile_fh);

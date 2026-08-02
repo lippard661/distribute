@@ -98,10 +98,12 @@ Arguments are one or more named items from the config file.
 ### install.pl
 
 Runs on a target host. Looks for files in `/var/install/` (or
-`/var/installation/` on macOS), verifies signatures, and installs.
-Integrates with syslock to unlock immutability flags before installation
-and re-lock afterward. Appends a record of what was installed to
-`/etc/CHANGELOG` (configurable to your own changelog location).
+`/var/installation/` on macOS, or /var/install/<hostname> (intended
+for when the target host is the sending host), verifies signatures,
+and installs. Integrates with syslock to unlock immutability flags
+before installation and re-lock afterward. Appends a record of what
+was installed to `/etc/CHANGELOG` (configurable to your own changelog
+location).
 
 **Package types handled**:
 - `<hostname>-<date>-<time>-package.tgz` — plain/custom package created

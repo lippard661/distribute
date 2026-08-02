@@ -131,6 +131,9 @@
 #    fallback, and effective-UID privilege check.
 # Modified 2 July 2026 by Jim Lippard to fix +DISPLAY hash calculation (and same
 #    issue for sample config file check).
+# Modified 1 August 2026 by Jim Lippard to use /var/install/<hostname> as
+#    source directory if present, to facilitate use of install.pl on the
+#    same host where distribute.pl is used.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -156,7 +159,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.5a of 2 July 2026.';
+my $VERSION = 'install.pl version 1.6 of 1 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -192,6 +195,7 @@ my $HOSTNAME = hostname();
 my (@HOSTNAME_ARRAY) = split (/\./, $HOSTNAME);
 my $DOMAINNAME = pop (@HOSTNAME_ARRAY);
 $DOMAINNAME = pop (@HOSTNAME_ARRAY) . '.' . $DOMAINNAME;
+my $SHORT_HOSTNAME = shift (@HOSTNAME_ARRAY);
 
 my $SIGNIFY_PUB_KEY_DIR = '/etc/signify';
 my $SIGNIFY_KEY_NAME = "$DOMAINNAME-$year-pkg";
@@ -277,8 +281,19 @@ $SIG{INT} = $SIG{TERM} = sub { die "Caught SIG$_[0], aborting.\n" };
 # Die if weird characters in domain name.
 die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
 
+# Die if weird characters in $SHORT_HOSTNAME.
+die "Invalid host name: $SHORT_HOSTNAME\n" unless ($SHORT_HOSTNAME =~ /^[\w.-]+$/);
+
 # Die if non-root
 die "Error. Must be run by root.\n" if ($> != 0);
+
+# If /var/install/$SHORT_HOSTNAME exists, use it instead.
+if (-d "$INSTALL_DIR/$SHORT_HOSTNAME") {
+    $INSTALL_DIR .= '/' . $SHORT_HOSTNAME;
+}
+
+# Don't proceed if $INSTALL_DIR is a symlink.
+die "Install dir must be a directory, but $INSTALL_DIR is a symlink. Cannot proceed.\n" if (-l $INSTALL_DIR);
 
 # username for the CHANGELOG entry, captured before pledge so we don't
 # need the 'getpw' promise later
