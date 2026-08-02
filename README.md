@@ -425,7 +425,7 @@ mkdir -p /var/installation   # macOS
 
 ### Dependencies
 
-**distribute.pl** (OpenBSD):
+**distribute.pl** (intended for OpenBSD but will run on Linux, macOS):
 - Perl 5
 - Archive::Tar, File::Basename, File::Copy, File::Path, Getopt::Std,
   IO::Uncompress::Gunzip, POSIX, Sys::Hostname (standard)

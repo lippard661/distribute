@@ -132,6 +132,8 @@
 #    Reject new IP address that's the same as old IP address, skip
 #    file updates for ip-address that don't change for a particular
 #    host.
+# Modified 2 August 2026 by Jim Lippard to add optional custom-vars
+#    require-source-dir and skip-files to _custom_ip_address.
 
 use strict;
 use warnings;
@@ -150,7 +152,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.5 of 1 August 2026.';
+my $VERSION = 'distribute.pl version 1.6 of 2 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -1279,13 +1281,15 @@ sub _custom_ip_address {
     my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
     my (%custom_vars, $old_address, $new_address, $new_rsync_host_suffix,
 	@source_paths, @dest_paths,
-	$host, $idx, $source_path, $dest_path);
+	$host, $idx, $source_path, $dest_path, %skip_file_hash);
     # global: $have_fake_dir, %host_package_files
     
     my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required',
 			       'wan1' => 'optional',
 			       'wan0-host-fqdn' => 'optional',
 			       'wan1-host-fqdn' => 'optional',
+			       'require-source-dir' => 'optional',
+			       'skip-files' => 'optional',
 			       'ipv6-name' => 'required',
 			       'dns' => 'required');
 
@@ -1295,10 +1299,42 @@ sub _custom_ip_address {
 
     my $CHMOD = '/bin/chmod';
 
-    # Will determine and return $new_rsync_host_suffix to force v4/v6 as needed.
-    ($old_address, $new_address, $new_rsync_host_suffix) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
+    # If require-source-dir is specified and not present, abort immediately.
+    if (defined ($custom_vars{'require-source-dir'}) &&
+	!-d $custom_vars{'require-source-dir'}) {
+	die "Required source dir $custom_vars{'require-source-dir'} is not present.\n";
+    }
+
+    # Do this early so that skip-files can use @dest_paths for validation.
     @source_paths = split (/,/, $file);
     @dest_paths = split (/,/, $dest);
+
+    # If skip-files is defined, turn it into a hash of hashes.
+    if (defined ($custom_vars{'skip-files'})) {
+	my @skip_file_values = split (/\&/, $custom_vars{'skip-files'});
+
+	# Get all the basenames (duplication with below).
+	my @dest_file_basenames;
+	foreach my $dest_path (@dest_paths) {
+	    my $dest_basename = basename ($dest_path);
+	    push (@dest_file_basenames, $dest_basename);
+	}
+	
+	foreach my $skip_file_value (@skip_file_values) {
+	    (my $skip_host, my $skip_file) = split (/:/, $skip_file_value, 2);
+	    die "Malformed skip-files entry (need host:destfile): $skip_file_value\n"
+		unless (defined $skip_host && length $skip_host
+			&& defined $skip_file && length $skip_file);
+	    die "Undefined host $skip_host in skip-files custom-var value $skip_file_value.\n" if (!grep { $_ eq $skip_host } @hosts);
+	    die "Undefined dest file basename $skip_file in skip-files entry: $skip_file_value\n"
+		unless (grep { $_ eq $skip_file } @dest_file_basenames);
+	    $skip_file_hash{$skip_host}{$skip_file} = 1;
+	}
+    }
+
+    # Will determine and return $new_rsync_host_suffix to force v4/v6 as needed.
+    ($old_address, $new_address, $new_rsync_host_suffix) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
+
 #	    $have_fake_dir = 1; done after call to this subroutine
     # I really want to take each corresponding source and dest path
     # to work on for each host as appropriate, so I need to use a
@@ -1308,6 +1344,8 @@ sub _custom_ip_address {
 	    $source_path = $source_paths[$idx];
 	    $dest_path = $dest_paths[$idx];
 	    ($dest_file, $dest_dir) = fileparse ($dest_path);
+	    # skip if defined in $skip_file_hash
+	    next if (defined ($skip_file_hash{$host}{$dest_file}));
 	    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
 	    # Need to insert $host in middle of source path.
 	    # $HOST is special-cased just like $SIGNIFY_PUB_KEY and
