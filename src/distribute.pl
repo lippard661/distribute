@@ -133,7 +133,14 @@
 #    file updates for ip-address that don't change for a particular
 #    host.
 # Modified 2 August 2026 by Jim Lippard to add optional custom-vars
-#    require-source-dir and skip-files to _custom_ip_address.
+#    require-source-dir and skip-files to _custom_ip_address. Update
+#    rsync path for Linux or macOS (though this is largely untested
+#    for non-OpenBSD).
+# Modified 6 August 2026 by Claude Opus 4.8 at the direction of Jim
+#    Lippard to genericize _custom_ip_address as _custom_substitute_files,
+#    in preparation for adding another instance for changing ip6 prefix
+#    delegations in files. Added ipv6-type custom-var (default "tunnel",
+#    is free form, can use "prefix delegation" or other).
 
 use strict;
 use warnings;
@@ -152,7 +159,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.6 of 2 August 2026.';
+my $VERSION = 'distribute.pl version 1.6a of 7 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -171,6 +178,7 @@ my $RSYNC_HOST_SUFFIXv6 = '-distributev6';
 
 my $MKDIR = '/bin/mkdir';
 my $RSYNC = '/usr/local/bin/rsync';
+$RSYNC = '/usr/bin/rsync' if ($^O eq 'linux' || $^O eq 'darwin');
 my $SIGNIFY = '/usr/bin/signify';
 my $STTY = '/bin/stty';
 my $UNAME = '/usr/bin/uname';
@@ -671,6 +679,12 @@ foreach $host (keys (%host_package_files)) {
 	push (@files_to_ship_and_remove, copy_package ("$host_package_path{$host}.grp", $host));
 	push (@files_to_ship_and_remove, copy_package ("$host_package_path{$host}.grp.sig", $host));
     }
+}
+
+# For, e.g., custom substitutions where all were no-ops and there's
+# nothing changed to ship, say so.
+if (!@files_to_ship_and_remove) {
+    print "No changed files to distribute.\n";
 }
 
 # Now actually distribute the packages to the destinations.
@@ -1276,33 +1290,30 @@ sub _custom_doas_dot_conf {
     }
 }
 
-# Subroutine for custom IP address change.
-sub _custom_ip_address {
-    my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
-    my (%custom_vars, $old_address, $new_address, $new_rsync_host_suffix,
-	@source_paths, @dest_paths,
-	$host, $idx, $source_path, $dest_path, %skip_file_hash);
-    # global: $have_fake_dir, %host_package_files
-    
-    my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required',
-			       'wan1' => 'optional',
-			       'wan0-host-fqdn' => 'optional',
-			       'wan1-host-fqdn' => 'optional',
-			       'require-source-dir' => 'optional',
-			       'skip-files' => 'optional',
-			       'ipv6-name' => 'required',
-			       'dns' => 'required');
+# Generic engine for custom string-substitution across a set of files:
+# stages each source into the fake dir, applies a per-file substitution
+# callback, honors skip-files and require-source-dir, detects no-ops, and
+# packages the result. The substitution itself (what "old" and "new" mean,
+# and how they're matched) is entirely in $substitute_cb, so new custom
+# types (e.g. ipv6-prefix) reuse this by passing a different callback.
+#
+# $substitute_cb->($staged_file_path) must perform the substitution in place
+# and return the number of changes (0 = no-op for that file/host).
+# $label is used only in the no-op warning ('IP' -> "No IP substitutions...").
+sub _custom_substitute_files {
+    my ($temp_dir, $custom_vars, $file, $dest, $substitute_cb, $label, @hosts) = @_;
+    my (%custom_vars, @source_paths, @dest_paths,
+        $host, $idx, $source_path, $dest_path, %skip_file_hash);
+    # global: $have_fake_dir, %host_package_files, $dest_file, $dest_dir
 
-    _custom_validate_custom_vars ('ip-address', $custom_vars, %REQ_OPT_CUSTOM_VARS);
-    
     %custom_vars = %{$custom_vars};
 
     my $CHMOD = '/bin/chmod';
 
     # If require-source-dir is specified and not present, abort immediately.
     if (defined ($custom_vars{'require-source-dir'}) &&
-	!-d $custom_vars{'require-source-dir'}) {
-	die "Required source dir $custom_vars{'require-source-dir'} is not present.\n";
+        !-d $custom_vars{'require-source-dir'}) {
+        die "Required source dir $custom_vars{'require-source-dir'} is not present.\n";
     }
 
     # Do this early so that skip-files can use @dest_paths for validation.
@@ -1311,83 +1322,97 @@ sub _custom_ip_address {
 
     # If skip-files is defined, turn it into a hash of hashes.
     if (defined ($custom_vars{'skip-files'})) {
-	my @skip_file_values = split (/\&/, $custom_vars{'skip-files'});
+        my @skip_file_values = split (/\&/, $custom_vars{'skip-files'});
 
-	# Get all the basenames (duplication with below).
-	my @dest_file_basenames;
-	foreach my $dest_path (@dest_paths) {
-	    my $dest_basename = basename ($dest_path);
-	    push (@dest_file_basenames, $dest_basename);
-	}
-	
-	foreach my $skip_file_value (@skip_file_values) {
-	    (my $skip_host, my $skip_file) = split (/:/, $skip_file_value, 2);
-	    die "Malformed skip-files entry (need host:destfile): $skip_file_value\n"
-		unless (defined $skip_host && length $skip_host
-			&& defined $skip_file && length $skip_file);
-	    die "Undefined host $skip_host in skip-files custom-var value $skip_file_value.\n" if (!grep { $_ eq $skip_host } @hosts);
-	    die "Undefined dest file basename $skip_file in skip-files entry: $skip_file_value\n"
-		unless (grep { $_ eq $skip_file } @dest_file_basenames);
-	    $skip_file_hash{$skip_host}{$skip_file} = 1;
-	}
+        my @dest_file_basenames;
+        foreach my $dp (@dest_paths) {
+            push (@dest_file_basenames, basename ($dp));
+        }
+
+        foreach my $skip_file_value (@skip_file_values) {
+            (my $skip_host, my $skip_file) = split (/:/, $skip_file_value, 2);
+            die "Malformed skip-files entry (need host:destfile): $skip_file_value\n"
+                unless (defined $skip_host && length $skip_host
+                        && defined $skip_file && length $skip_file);
+            die "Undefined host $skip_host in skip-files custom-var value $skip_file_value.\n" if (!grep { $_ eq $skip_host } @hosts);
+            die "Undefined dest file basename $skip_file in skip-files entry: $skip_file_value\n"
+                unless (grep { $_ eq $skip_file } @dest_file_basenames);
+            $skip_file_hash{$skip_host}{$skip_file} = 1;
+        }
     }
 
-    # Will determine and return $new_rsync_host_suffix to force v4/v6 as needed.
-    ($old_address, $new_address, $new_rsync_host_suffix) = _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
-
-#	    $have_fake_dir = 1; done after call to this subroutine
-    # I really want to take each corresponding source and dest path
-    # to work on for each host as appropriate, so I need to use a
-    # for loop instead of foreach.
     foreach $host (@hosts) {
-	for ($idx = 0; $idx <= $#source_paths; $idx++) {
-	    $source_path = $source_paths[$idx];
-	    $dest_path = $dest_paths[$idx];
-	    ($dest_file, $dest_dir) = fileparse ($dest_path);
-	    # skip if defined in $skip_file_hash
-	    next if (defined ($skip_file_hash{$host}{$dest_file}));
-	    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
-	    # Need to insert $host in middle of source path.
-	    # $HOST is special-cased just like $SIGNIFY_PUB_KEY and
-	    # $SIGNIFY_PUB_KEY_NEXT (except the latter two are done
-	    # at config parse time rather than execution time).
-	    if ($source_path =~ /\$HOST/) {
-		$source_path =~ s/\$HOST/$host/;
-		# Check for source path existence. (Is backup mounted?)
-		# Would be better if this were more graceful, cleaned
-		# up temp files, or even alternatively used another
-		# source (/var/db/servers is available).
-		if (!-e $source_path) {
-		    die "Source path missing, can use /var/db/servers if urgent: $source_path\n";
-		}
+        for ($idx = 0; $idx <= $#source_paths; $idx++) {
+            $source_path = $source_paths[$idx];
+            $dest_path = $dest_paths[$idx];
+            ($dest_file, $dest_dir) = fileparse ($dest_path);
+            # skip if defined in $skip_file_hash
+            next if (defined ($skip_file_hash{$host}{$dest_file}));
+            $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
+            # $HOST is special-cased (substituted at execution time).
+            if ($source_path =~ /\$HOST/) {
+                $source_path =~ s/\$HOST/$host/;
+                if (!-e $source_path) {
+                    die "Source path missing, can use /var/db/servers if urgent: $source_path\n";
+                }
 
-		# It doesn't hurt to do this if the dir already exists.
-		make_fake_dir ($temp_dir, $dest_dir, $host);
-		# Copy the source file to the destination. -p to
-		# preserve permissions. (Doesn't work for pf.conf.)
-		cp ($source_path, "$temp_dir/$host/$dest_path")
-		    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
+                make_fake_dir ($temp_dir, $dest_dir, $host);
+                cp ($source_path, "$temp_dir/$host/$dest_path")
+                    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
 
-		# Update the file by changing the IP addresses.
-		my $changed = _custom_global_replace_in_file ("$temp_dir/$host/$dest_path", $old_address, $new_address, 1); # also replace dot-escaped IPs
+                my $changed = $substitute_cb->("$temp_dir/$host/$dest_path");
 
-		if (!$changed) {
-		    warn "No IP substitutions in $dest_path for $host; skipping (no-op for this host).\n";
-		    unlink ("$temp_dir/$host/$dest_path");
-		    next; # skip this host for this file
-		}
+                if (!$changed) {
+                    warn "No $label substitutions in $dest_path for $host; skipping (no-op for this host).\n";
+                    unlink ("$temp_dir/$host/$dest_path");
+                    next; # skip this host for this file
+                }
 
-		# Manually remove g and o read permissions.
-		# This must occur AFTER the call to _custom_global_replace_in_file,
-		# which creates a new file with default permissions.
-		if ($dest_path =~ /\/pf\.conf$/) {
-		    system ($CHMOD, 'go-r', "$temp_dir/$host/$dest_path");
-		}
-		
-		push (@{$host_package_files{$host}}, $dest_path);
-	    }
-	}
+                # Manually remove g and o read permissions. Must occur AFTER
+                # the substitution, which recreates the file with default perms.
+                if ($dest_path =~ /\/pf\.conf$/) {
+                    system ($CHMOD, 'go-r', "$temp_dir/$host/$dest_path");
+                }
+
+                push (@{$host_package_files{$host}}, $dest_path);
+            }
+        }
     }
+}
+
+# Subroutine for custom IP address change. Type-specific glue over the
+# generic _custom_substitute_files engine: validates ip-address's custom
+# vars, acquires old/new addresses (and the v4/v6 rsync suffix), and hands
+# the engine a callback that does the dotted + dot-escaped substitution.
+sub _custom_ip_address {
+    my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
+    my (%custom_vars, $old_address, $new_address, $new_rsync_host_suffix);
+
+    my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required',
+                               'wan1' => 'optional',
+                               'wan0-host-fqdn' => 'optional',
+                               'wan1-host-fqdn' => 'optional',
+                               'require-source-dir' => 'optional',
+                               'skip-files' => 'optional',
+                               'ipv6-name' => 'required',
+			       'ipv6-type' => 'optional',
+                               'dns' => 'required');
+
+    _custom_validate_custom_vars ('ip-address', $custom_vars, %REQ_OPT_CUSTOM_VARS);
+
+    %custom_vars = %{$custom_vars};
+
+    # Determine old/new addresses and the v4/v6 suffix to force on rsync.
+    ($old_address, $new_address, $new_rsync_host_suffix) =
+        _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'ipv6-type'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
+
+    # 1 = also replace dot-escaped IPs; that flag is ip-address-specific and
+    # lives here in the callback, not in the generic engine.
+    _custom_substitute_files (
+        $temp_dir, $custom_vars, $file, $dest,
+        sub { _custom_global_replace_in_file ($_[0], $old_address, $new_address, 1) },
+        'IP',
+        @hosts);
 
     return $new_rsync_host_suffix;
 }
@@ -1397,7 +1422,7 @@ sub _custom_ip_address {
 # Assumes IPv6 is tunnel over wan0.
 # Returns $new_rsync_host_suffix up for $rsync_host_suffix to be changed in main.
 sub _custom_get_old_and_new_ip_addresses {
-    my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $dns, $wan0, $wan1) = @_;
+    my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $ipv6_type, $dns, $wan0, $wan1) = @_;
     use Socket qw( :addrinfo SOCK_RAW );
     my ($old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1, $host_fqdn);
@@ -1423,10 +1448,13 @@ sub _custom_get_old_and_new_ip_addresses {
 
     print "Warning: Must manually update /etc/faild.conf and /etc/reportnew/reportnew.conf.\n";
     if ($wan0_or_wan1 eq $lc_wan0) {
-	# Assume wan0 has IPv6 tunnel.
-	print "Distributing via v4 (default) since v6 tunnel is down.\n";
-	print "Warning: Must manually update $ipv6_name tunnel.\n";
-	print "Warning: Must manually update firewall tunnel and policies.\n";
+	# Assume wan0 has IPv6 tunnel or prefix delegation.
+	if (!defined ($ipv6_type)) {
+	    $ipv6_type = 'tunnel';
+	}
+	print "Distributing via v4 (default) since v6 $ipv6_type is down.\n";
+	print "Warning: Must manually update $ipv6_name $ipv6_type.\n";
+	print "Warning: Must manually update firewall $ipv6_type-related configurations.\n";
 	$new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
 	$host_fqdn = $wan0_host_fqdn;
     }
