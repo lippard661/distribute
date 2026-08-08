@@ -140,7 +140,11 @@
 #    Lippard to genericize _custom_ip_address as _custom_substitute_files,
 #    in preparation for adding another instance for changing ip6 prefix
 #    delegations in files. Added ipv6-type custom-var (default "tunnel",
-#    is free form, can use "prefix delegation" or other).
+#    can use "prefix delegation" or "other").
+# Modified 7 August 2026 by Jim Lippard to add ipv6-endpoint custom-var,
+#    make ipv6-name optional, change rules on when to use IPv6 (see below
+#    or config). Added partly Claude Opus 4.8 rewritten/refactored code
+#    for _custom_ipv6_prefix and new custom file type ipv6-prefix.
 
 use strict;
 use warnings;
@@ -159,7 +163,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.6a of 7 August 2026.';
+my $VERSION = 'distribute.pl version 1.7 of 7 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -635,6 +639,12 @@ foreach $file (@files) {
 	# This does not change /etc/faild.conf for hagbard.
 	elsif ($file eq 'ip-address') {
 	    my $new_rsync_host_suffix = _custom_ip_address ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
+	    $rsync_host_suffix = $new_rsync_host_suffix; # force v4 or v6 as needed
+	    $have_fake_dir = 1;
+	}
+	# Change IPv6 delegated prefix.
+	elsif ($file eq 'ipv6-prefix') {
+	    my $new_rsync_host_suffix = _custom_ipv6_prefix ($temp_dir, $CONFIG{$file}{CUSTOMVARS}, $CONFIG{$file}{FILE}, $CONFIG{$file}{DEST}, @process_hosts);
 	    $rsync_host_suffix = $new_rsync_host_suffix; # force v4 or v6 as needed
 	    $have_fake_dir = 1;
 	}
@@ -1388,23 +1398,26 @@ sub _custom_ip_address {
     my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
     my (%custom_vars, $old_address, $new_address, $new_rsync_host_suffix);
 
-    my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required',
-                               'wan1' => 'optional',
-                               'wan0-host-fqdn' => 'optional',
-                               'wan1-host-fqdn' => 'optional',
-                               'require-source-dir' => 'optional',
-                               'skip-files' => 'optional',
-                               'ipv6-name' => 'required',
-			       'ipv6-type' => 'optional',
-                               'dns' => 'required');
+    my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required', # name of provider
+                               'wan1' => 'optional', # name of provider
+                               'wan0-host-fqdn' => 'optional', # FQDN of WAN
+                               'wan1-host-fqdn' => 'optional', # FQDN of WAN
+                               'require-source-dir' => 'optional', # config file source location
+                               'skip-files' => 'optional', # host:file&host&file
+                               'ipv6-name' => 'optional', # name of IPv6 provider
+			       'ipv6-type' => 'optional', # tunnel, prefix delegation, or other
+			       'ipv6-endpoint' => 'optional', # wan0 or wan1
+                               'dns' => 'required'); # name of DNS provider
 
     _custom_validate_custom_vars ('ip-address', $custom_vars, %REQ_OPT_CUSTOM_VARS);
 
     %custom_vars = %{$custom_vars};
 
     # Determine old/new addresses and the v4/v6 suffix to force on rsync.
+    # Currently assumes IPv6 is dependent on wan0 IP address as a tunnel endpoint,
+    # should implement additional custom-var(s) to specify any dependency or prompt.
     ($old_address, $new_address, $new_rsync_host_suffix) =
-        _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'ipv6-type'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
+        _custom_get_old_and_new_ip_addresses ($custom_vars{'wan0-host-fqdn'}, $custom_vars{'wan1-host-fqdn'}, $custom_vars{'ipv6-name'}, $custom_vars{'ipv6-type'}, $custom_vars{'ipv6-endpoint'}, $custom_vars{'dns'}, $custom_vars{'wan0'}, $custom_vars{'wan1'});
 
     # 1 = also replace dot-escaped IPs; that flag is ip-address-specific and
     # lives here in the callback, not in the generic engine.
@@ -1422,9 +1435,9 @@ sub _custom_ip_address {
 # Assumes IPv6 is tunnel over wan0.
 # Returns $new_rsync_host_suffix up for $rsync_host_suffix to be changed in main.
 sub _custom_get_old_and_new_ip_addresses {
-    my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $ipv6_type, $dns, $wan0, $wan1) = @_;
+    my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $ipv6_type, $ipv6_endpoint, $dns, $wan0, $wan1) = @_;
     use Socket qw( :addrinfo SOCK_RAW );
-    my ($old_address, $new_address, $wan0_or_wan1,
+    my ($have_ipv6, $old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1, $host_fqdn);
     my $new_rsync_host_suffix;
 
@@ -1438,6 +1451,26 @@ sub _custom_get_old_and_new_ip_addresses {
 	$lc_wan1 = lc ($wan1);
     }
 
+    if (defined ($ipv6_name)) {
+	$have_ipv6 = 1;
+	if (!defined ($ipv6_type)) {
+	    $ipv6_type = 'tunnel';
+	}
+	elsif ($ipv6_type ne 'tunnel' && $ipv6_type ne 'prefix delegation' &&
+	       $ipv6_type ne 'other') {
+	    die "Invalid value for custom-var ipv6-type, must be \"tunnel\", \"prefix delegation\", or \"other\", not \"$ipv6_type\".\n";
+	}
+	if (!defined ($ipv6_endpoint)) {
+	    $ipv6_endpoint = 'wan0';
+	}
+	elsif ($ipv6_endpoint ne 'wan0' && $ipv6_endpoint ne 'wan1') {
+	    die "Invalid value for custom-var ipv6-endpoint, must be \"wan0\" or \"wan1\", not \"$ipv6_endpoint\".\n";
+	}
+    }
+    else {
+	$have_ipv6 = 0;
+    }
+
     while ($wan0_or_wan1 eq 'null') {
 	print "$wan0 or $wan1? ";
 	$wan0_or_wan1 = <STDIN>;
@@ -1446,23 +1479,44 @@ sub _custom_get_old_and_new_ip_addresses {
 	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
     }
 
-    print "Warning: Must manually update /etc/faild.conf and /etc/reportnew/reportnew.conf.\n";
+    # Use IPv6 if available and not changing an IPv6 tunnel endpoint IP.
     if ($wan0_or_wan1 eq $lc_wan0) {
-	# Assume wan0 has IPv6 tunnel or prefix delegation.
-	if (!defined ($ipv6_type)) {
-	    $ipv6_type = 'tunnel';
+	if ($have_ipv6 && $ipv6_type eq 'tunnel' && $ipv6_endpoint eq 'wan0') {
+	    print "Distributing via v4 since $ipv6_name v6 $ipv6_type is down.\n";
+	    print "Warning: Must manually update $ipv6_name $ipv6_type.\n";
+	    print "Warning: Must manually update firewall $ipv6_type-related configurations.\n";
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	    $host_fqdn = $wan0_host_fqdn;
 	}
-	print "Distributing via v4 (default) since v6 $ipv6_type is down.\n";
-	print "Warning: Must manually update $ipv6_name $ipv6_type.\n";
-	print "Warning: Must manually update firewall $ipv6_type-related configurations.\n";
-	$new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
-	$host_fqdn = $wan0_host_fqdn;
+	elsif ($have_ipv6) {
+	    print "Distributing via $ipv6_name v6 since it should not be impacted by $wan0 IP change.\n";
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
+	    $host_fqdn = $wan0_host_fqdn;
+	}
+	else {
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	    $host_fqdn = $wan0_host_fqdn;
+	}
+	print "Warning: Must manually update DNS record via $dns.\n";
     }
     else { # wan1
-	print "Distributing via v6 since v4 address doesn't have access.\n";
+	if ($have_ipv6 && $ipv6_type eq 'tunnel' && $ipv6_endpoint eq 'wan1') {
+	    print "Distributing via v4 since $ipv6_name v6 $ipv6_type is down.\n";
+	    print "Warning: Must manually update $ipv6_name $ipv6_type.\n";
+	    print "Warning: Must manually update firewall $ipv6_type-related configurations.\n";
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	    $host_fqdn = $wan1_host_fqdn;
+	}
+	elsif ($have_ipv6) {
+	    print "Distributing via $ipv6_name v6 since it should not be impacted by $wan1 IP change.\n";
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
+	    $host_fqdn = $wan1_host_fqdn;
+	}
+	else {
+	    $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4;
+	    $host_fqdn = $wan1_host_fqdn;
+	}
 	print "Warning: Must manually update DNS record via $dns.\n";
-	$new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv6;
-	$host_fqdn = $wan1_host_fqdn;
     }
     if (defined ($host_fqdn)) {
 	$old_address = _get_wan_ip ($host_fqdn);
@@ -1557,6 +1611,277 @@ sub _custom_global_replace_in_file {
     close ($outfile_fh);
     unlink ($backup_file);
     return ($changed); # did anything change?
+}
+
+# Subroutine for custom IPv6 prefix delegation change.  Type-specific
+# glue over the generic _custom_substitute_files engine: validates
+# custom vars, acquires old/new addresses, and provides a callback
+# that does the substitution. Assumes at least one prefix delegation
+# interface but supports a second.
+sub _custom_ipv6_prefix {
+    my ($temp_dir, $custom_vars, $file, $dest, @hosts) = @_;
+    my %custom_vars;
+
+    my %REQ_OPT_CUSTOM_VARS = ('wan0' => 'required', # name of provider
+                               'wan1' => 'optional', # name of provider
+			       'wan0-prefix-file' => 'optional', # dhcpleased /var/run/db/dhcp6leased/<interface>, backup has old one
+                               'wan1-prefix-file' => 'optional',
+                               'require-source-dir' => 'optional', # source of config files
+                               'skip-files' => 'optional'); # host:file&host:file
+
+    _custom_validate_custom_vars ('ipv6-prefix', $custom_vars, %REQ_OPT_CUSTOM_VARS);
+
+    %custom_vars = %{$custom_vars};
+
+    # Determine old/new prefixes and whether we use IPv4 (if primary IPv6 is down) or IPv6 (if primary IPv6 is up).
+    # We assume wan0 is primary IPv6 and wan1 is a backup IPv6.
+    my ($old_h123, $old_h4top, $old_len,
+        $new_h123, $new_h4top, $new_len, $new_rsync_host_suffix) =
+        _custom_get_old_and_new_ip6_prefixes ($custom_vars{'wan0'}, $custom_vars{'wan1'},
+                                              $custom_vars{'wan0-prefix-file'}, $custom_vars{'wan1-prefix-file'});
+
+    if ($old_len == $new_len) {
+	# same-length: proven-correct numeric substitution, no gating
+    }
+    elsif ($old_len == 56 && $new_len == 60) {
+	# narrowing: auto-proceed, but the substitute pass must die if any
+	# matched address's newly-constrained nibble wasn't already the new
+	# prefix's value (i.e. would be silently renumbered/orphaned)
+    }
+    else {  # 60 -> 56, widening
+	die "IPv6 prefix widening ($old_len -> $new_len) requires a subnet "
+	    . "renumbering decision; handle these files manually.\n";
+    }
+
+    _custom_substitute_files (
+        $temp_dir, $custom_vars, $file, $dest,
+        sub { _custom_ipv6_substitute_in_file ($_[0],
+                  $old_h123, $old_h4top, $old_len,
+                  $new_h123, $new_h4top, $new_len) },
+        'IPv6 prefix delegation',
+        @hosts);
+
+    return $new_rsync_host_suffix;
+}
+
+# Subroutine to get old and new IPv6 prefix delegation strings.
+sub _custom_get_old_and_new_ip6_prefixes {
+    my ($wan0, $wan1, $wan0_prefix_file, $wan1_prefix_file) = @_;
+    my ($lc_wan0, $lc_wan1, $wan0_or_wan1,
+	$old_prefix, $new_prefix);
+
+    $lc_wan0 = lc ($wan0);
+
+    if (!defined ($wan1)) {
+	$wan0_or_wan1 = $wan0;
+    }
+    else {
+	$wan0_or_wan1 = 'null';
+	$lc_wan1 = lc ($wan1);
+    }
+
+    while ($wan0_or_wan1 eq 'null') {
+	print "$wan0 or $wan1? ";
+	$wan0_or_wan1 = <STDIN>;
+	chomp ($wan0_or_wan1);
+	$wan0_or_wan1 = lc ($wan0_or_wan1);
+	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
+    }
+
+    $old_prefix = 'null';
+    
+    # use prefix files if supplied
+    if ($wan0_or_wan1 eq $lc_wan0) {
+	if (defined ($wan0_prefix_file)) {
+	    $old_prefix = _custom_get_prefix_delegation ($wan0_prefix_file);
+	}
+    }
+    else {
+	if (defined ($wan1_prefix_file)) {
+	    $old_prefix = _custom_get_prefix_delegation ($wan1_prefix_file);
+	}
+    }
+
+    my $old_prefix_body;
+    my $old_prefix_len;
+    while (1) {
+	print "Old prefix: $old_prefix (return or enter correct): ";
+	my $input_string = <STDIN>;
+	chomp ($input_string);
+	$input_string = $old_prefix if ($input_string eq '');
+	if ($input_string =~ /^((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4})::\/(\d{2})$/) {
+	    $old_prefix_body = $1;
+	    $old_prefix_len = $2;
+	    last if ($old_prefix_len == 56 || $old_prefix_len == 60);
+	    warn "Invalid prefix length $old_prefix_len, must be 56 or 60.\n";
+	}
+	else {
+	    print "Invalid response \"$input_string\". Enter new IPv6 prefix or hit return.\n";
+	}
+    }
+
+    $new_prefix = 'null';
+    my $new_prefix_body;
+    my $new_prefix_len;
+    while ($new_prefix eq 'null') {
+    	  print "New prefix: ";
+    	  $new_prefix = <STDIN>;
+    	  chomp ($new_prefix);
+	  if ($new_prefix =~ /^((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4})::\/(\d{2})$/) {
+	      $new_prefix_body = $1;
+	      $new_prefix_len = $2;
+	      if ($new_prefix_body eq $old_prefix_body && $new_prefix_len == $old_prefix_len) {
+		  print "New IPv6 prefix $new_prefix is the same as old prefix $old_prefix. Try again.\n";
+		  $new_prefix = 'null';
+	      }
+	      elsif ($new_prefix_len != 56 && $new_prefix_len != 60) {
+		  warn "Invalid prefix length $new_prefix_len, must be 56 or 60. $new_prefix\n";
+	      }
+	  }
+	  else {
+	      $new_prefix = 'null';
+	      next;
+	  }
+    }
+
+    # At this point $old_prefix and $new_prefix are canonical (hextets 1-3
+    # plus hextet 4, no trailing ::/len -- _custom_canonicalize_prefix
+    # stripped that). Decompose each into hextets 1-3 and the numeric
+    # hextet-4 prefix value for the numeric substitution engine.
+    my ($old_h123, $old_h4top) = _ipv6_decompose_prefix ($old_prefix_body, $old_prefix_len);
+    my ($new_h123, $new_h4top) = _ipv6_decompose_prefix ($new_prefix_body, $new_prefix_len);
+
+    my $new_rsync_host_suffix = $RSYNC_HOST_SUFFIXv4; # unless wan-dependency vars added later
+    return ($old_h123, $old_h4top, $old_prefix_len,
+            $new_h123, $new_h4top, $new_prefix_len,
+            $new_rsync_host_suffix);
+}
+
+# Split a canonical /56 or /60 prefix ("h1:h2:h3:h4") into its first three
+# hextets (as a string) and hextet 4 masked to prefix bits only (as a number).
+# Assumes _custom_canonicalize_prefix has already validated and canonicalized.
+sub _ipv6_decompose_prefix {
+    my ($prefix, $len) = @_;
+
+    my @hextets = split (/:/, $prefix);
+    die "Internal error: canonical prefix \"$prefix\" does not have 4 hextets.\n"
+        unless (@hextets == 4);
+
+    my $h123 = join (':', @hextets[0..2]);
+    my $h4   = hex ($hextets[3]);
+    my $h4top = $h4 & _ipv6_h4_prefix_mask ($len);   # zero the host bits
+
+    return ($h123, $h4top);
+}
+
+# Subroutine to obtain an IPv6 prefix from a file such as a dhcp6leased file (/var/db/dhcp6leased/<interface-name>).
+# Format can also be a CIDR-format IPv6 prefix.
+# Assumes 2-4 characters per hextet and four hextets.
+sub _custom_get_prefix_delegation {
+    my ($file) = @_;
+
+    open (my $fh, '<', $file) || die "Cannot open prefix delegation file $file. $!\n";
+    my $prefix = <$fh>;
+    close ($fh);
+    chomp ($prefix);
+
+    my $prefix_len;
+    # dhcp6leased file, we only look at the first delegated prefix.
+    if ($prefix =~ /^ia_pd \d ((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4}::) (\d{2})$/) {
+	$prefix = "$1/$2";
+	$prefix_len = $2;
+    }
+    elsif ($prefix =~ /^(?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4}::\/(\d{2})$/) {
+	$prefix_len = $1; # just capture length, $prefix is OK if the length is OK.
+    }
+    else {
+	die "Cannot extract valid prefix from prefix file $file, just \"$prefix\".\n";
+    }
+
+    die "Invalid prefix length $prefix_len, must be 56 or 60. $prefix\n" unless ($prefix_len == 56 || $prefix_len == 60);
+
+    return $prefix;
+}
+
+# Numeric helpers for hextet-4 prefix logic. A /56 prefix occupies the top
+# 8 bits of hextet 4; a /60, the top 12 bits. The remaining low bits are
+# host/subnet and must be preserved when rewriting an embedded address.
+sub _ipv6_h4_prefix_mask {
+    my ($len) = @_;                 # 56 or 60
+    my $prefix_bits_in_h4 = $len - 48;      # 8 for /56, 12 for /60
+    return (0xFFFF << (16 - $prefix_bits_in_h4)) & 0xFFFF;
+}
+
+# Substitute the old IPv6 prefix with the new one in $file.
+# Two passes: bare CIDR prefixes (rewrite prefix bits AND /NN), then
+# prefixes embedded in full addresses (rewrite prefix bits, preserve host bits).
+# $old_h123/$new_h123 : canonical hextets 1-3, e.g. "2001:db8:ab"
+# $old_h4top/$new_h4top: hextet-4 value with only prefix bits set (host bits 0)
+# $old_len/$new_len    : 56 or 60
+sub _custom_ipv6_substitute_in_file {
+    my ($file, $old_h123, $old_h4top, $old_len,
+                $new_h123, $new_h4top, $new_len) = @_;
+
+    my $old_mask = _ipv6_h4_prefix_mask ($old_len);
+    my $new_host_mask = (~_ipv6_h4_prefix_mask ($new_len)) & 0xFFFF;
+    my $changed = 0;
+
+    my $bak = "$file.bak";
+    rename ($file, $bak) || die "Cannot rename $file to $bak. $!\n";
+    open (my $in,  '<', $bak)  || die "Cannot open $bak. $!\n";
+    open (my $out, '>', $file) || die "Cannot open $file. $!\n";
+
+    while (my $line = <$in>) {
+	my $before = $line;
+        # PASS 1: bare CIDR prefix "h123:h4::/oldlen" -> "newh123:newh4::/newlen"
+        # Anchored on ::/NN so it can't fire inside a longer address.
+        ($line =~ s{
+            \Q$old_h123\E : ([0-9a-fA-F]{1,4}) :: / $old_len (?![0-9])
+        }{
+            my $h4 = hex ($1);
+            if (($h4 & $old_mask) == ($old_h4top & $old_mask)) {
+                # bare prefix: host bits are zero by definition
+                sprintf ("%s:%x::/%d", $new_h123, $new_h4top, $new_len);
+            }
+            else {
+                "$old_h123:$1\::/$old_len";   # not our prefix: leave verbatim
+            }
+        }gex);
+
+        # PASS 2: prefix embedded in a full address "h123:h4:...."
+        # Rewrite the prefix bits of hextet 4, keep its host bits, keep the rest
+        # of the address (the \b stops us at the hextet; the tail is untouched).
+	($line =~ s{
+            \Q$old_h123\E : ([0-9a-fA-F]{1,4}) \b (?! :* / \d)	
+        }{
+            my $h4 = hex ($1);
+            my $newly_constrained = _ipv6_h4_prefix_mask($new_len) & ~_ipv6_h4_prefix_mask($old_len) & 0xFFFF;
+            if (($h4 & $newly_constrained) != ($new_h4top & $newly_constrained)) {
+               die sprintf("Address hextet-4 %#x has subnet bits that would be lost "
+                         . "narrowing /%d -> /%d; manual renumbering required.\n",
+                         $h4, $old_len, $new_len);
+            }
+            if (($h4 & $old_mask) == ($old_h4top & $old_mask)) {
+                my $host = $h4 & $new_host_mask;     # preserve host bits
+                sprintf ("%s:%x", $new_h123, ($new_h4top | $host));
+            }
+            else {
+                "$old_h123:$1";                       # different subnet: leave it
+            }
+        }gex);
+
+	$changed++ if ($line ne $before);
+        print $out $line;
+	# Coverage audit: prefix is present but we changed nothing on this line.
+	if ($line eq $before && $line =~ /\Q$old_h123\E:/i) {
+	    warn "Coverage: $file line $.: contains prefix $old_h123 but no "
+		. "substitution fired (spelling? length mismatch?): $line";
+	}
+    }
+    close ($in);
+    close ($out);
+    unlink ($bak);
+    return $changed;
 }
 
 ### End custom packages.
