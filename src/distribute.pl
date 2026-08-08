@@ -145,6 +145,10 @@
 #    make ipv6-name optional, change rules on when to use IPv6 (see below
 #    or config). Added partly Claude Opus 4.8 rewritten/refactored code
 #    for _custom_ipv6_prefix and new custom file type ipv6-prefix.
+# Modified 8 August 2026 by Claude Opus 4.8 at the direction of Jim Lippard
+#    to modify ipv6-prefix to rewrite larger prefixes within the changing
+#    prefix delegation (and attempt to do so for /56-/60 transitions for
+#    longer prefixes that aren't orphaned).
 
 use strict;
 use warnings;
@@ -163,7 +167,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.7 of 7 August 2026.';
+my $VERSION = 'distribute.pl version 1.7a of 8 August 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -1822,8 +1826,10 @@ sub _custom_ipv6_substitute_in_file {
     my ($file, $old_h123, $old_h4top, $old_len,
                 $new_h123, $new_h4top, $new_len) = @_;
 
-    my $old_mask = _ipv6_h4_prefix_mask ($old_len);
-    my $new_host_mask = (~_ipv6_h4_prefix_mask ($new_len)) & 0xFFFF;
+    my $old_mask      = _ipv6_h4_prefix_mask ($old_len);
+    my $new_mask      = _ipv6_h4_prefix_mask ($new_len);
+    my $new_host_mask = (~$new_mask) & 0xFFFF;
+    my $newly         = $new_mask & ~$old_mask & 0xFFFF;  # prefix-under-new, host-under-old
     my $changed = 0;
 
     my $bak = "$file.bak";
@@ -1832,51 +1838,62 @@ sub _custom_ipv6_substitute_in_file {
     open (my $out, '>', $file) || die "Cannot open $file. $!\n";
 
     while (my $line = <$in>) {
-	my $before = $line;
-        # PASS 1: bare CIDR prefix "h123:h4::/oldlen" -> "newh123:newh4::/newlen"
-        # Anchored on ::/NN so it can't fire inside a longer address.
+        my $before = $line;
+
+        # PASS 1: the bare delegation CIDR itself (::/oldlen exactly).
         ($line =~ s{
             \Q$old_h123\E : ([0-9a-fA-F]{1,4}) :: / $old_len (?![0-9])
         }{
             my $h4 = hex ($1);
-            if (($h4 & $old_mask) == ($old_h4top & $old_mask)) {
-                # bare prefix: host bits are zero by definition
-                sprintf ("%s:%x::/%d", $new_h123, $new_h4top, $new_len);
+            (($h4 & $old_mask) == $old_h4top)
+              ? sprintf ("%s:%x::/%d", $new_h123, $new_h4top, $new_len)
+              : "$old_h123:$1\::/$old_len";
+        }gex);
+
+        # PASS 1b: in-prefix CIDRs LONGER than the delegation (e.g. /64s under
+        # the /60). Rewrite the delegation prefix bits, preserve the
+        # sub-delegation bits (which /64) and the /NN length. On a narrowing
+        # transition, a /64 whose now-prefix bits fall outside the new
+        # delegation is orphaned -> warn and leave verbatim.
+        ($line =~ s{
+            \Q$old_h123\E : ([0-9a-fA-F]{1,4}) :: / (\d+) \b
+        }{
+            my ($h4, $nn) = (hex ($1), $2);
+            if    ($nn <= $old_len)                        { "$old_h123:$1\::/$nn"; }
+            elsif (($h4 & $old_mask) != $old_h4top)        { "$old_h123:$1\::/$nn"; }
+            elsif (($h4 & $newly) != ($new_h4top & $newly)) {
+                warn sprintf ("Orphaned /%d under prefix: %s:%x::/%d falls outside "
+                            . "new /%d delegation; left unchanged.\n",
+                              $nn, $old_h123, $h4, $nn, $new_len);
+                "$old_h123:$1\::/$nn";
             }
             else {
-                "$old_h123:$1\::/$old_len";   # not our prefix: leave verbatim
+                my $sub = $h4 & $new_host_mask;
+                sprintf ("%s:%x::/%d", $new_h123, ($new_h4top | $sub), $nn);
             }
         }gex);
 
-        # PASS 2: prefix embedded in a full address "h123:h4:...."
-        # Rewrite the prefix bits of hextet 4, keep its host bits, keep the rest
-        # of the address (the \b stops us at the hextet; the tail is untouched).
-	($line =~ s{
-            \Q$old_h123\E : ([0-9a-fA-F]{1,4}) \b (?! :* / \d)	
+        # PASS 2: prefix embedded in a full address.
+        ($line =~ s{
+            \Q$old_h123\E : ([0-9a-fA-F]{1,4}) \b (?! :* / \d)
         }{
             my $h4 = hex ($1);
-            my $newly_constrained = _ipv6_h4_prefix_mask($new_len) & ~_ipv6_h4_prefix_mask($old_len) & 0xFFFF;
-            if (($h4 & $newly_constrained) != ($new_h4top & $newly_constrained)) {
-               die sprintf("Address hextet-4 %#x has subnet bits that would be lost "
-                         . "narrowing /%d -> /%d; manual renumbering required.\n",
-                         $h4, $old_len, $new_len);
+            if (($h4 & $newly) != ($new_h4top & $newly)) {
+                die sprintf ("Address hextet-4 %#x has subnet bits that would be "
+                           . "lost narrowing /%d -> /%d; manual renumbering required.\n",
+                             $h4, $old_len, $new_len);
             }
-            if (($h4 & $old_mask) == ($old_h4top & $old_mask)) {
-                my $host = $h4 & $new_host_mask;     # preserve host bits
-                sprintf ("%s:%x", $new_h123, ($new_h4top | $host));
-            }
-            else {
-                "$old_h123:$1";                       # different subnet: leave it
-            }
+            (($h4 & $old_mask) == $old_h4top)
+              ? sprintf ("%s:%x", $new_h123, ($new_h4top | ($h4 & $new_host_mask)))
+              : "$old_h123:$1";
         }gex);
 
-	$changed++ if ($line ne $before);
+        $changed++ if ($line ne $before);
         print $out $line;
-	# Coverage audit: prefix is present but we changed nothing on this line.
-	if ($line eq $before && $line =~ /\Q$old_h123\E:/i) {
-	    warn "Coverage: $file line $.: contains prefix $old_h123 but no "
-		. "substitution fired (spelling? length mismatch?): $line";
-	}
+        if ($line eq $before && $line =~ /\Q$old_h123\E:/i) {
+            warn "Coverage: $file line $.: contains prefix $old_h123 but no "
+               . "substitution fired (spelling? length mismatch?): $line";
+        }
     }
     close ($in);
     close ($out);
