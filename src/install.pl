@@ -134,6 +134,10 @@
 # Modified 1 August 2026 by Jim Lippard to use /var/install/<hostname> as
 #    source directory if present, to facilitate use of install.pl on the
 #    same host where distribute.pl is used.
+# Modified 16 September 2026 by Jim Lippard to gracefully handle one or two component
+#    hostnames (as might be observed on macOS when not in home location) and allow
+#    -k custom key specification. Remove requirement for PLIST comment in packages.
+#    Allow common variable substitutions in @sample lines.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -159,7 +163,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.6 of 1 August 2026.';
+my $VERSION = 'install.pl version 1.7 of 16 September 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -192,10 +196,29 @@ $year += 1900;
 my $prev_year = $year - 1;
 
 my $HOSTNAME = hostname();
-my (@HOSTNAME_ARRAY) = split (/\./, $HOSTNAME);
-my $DOMAINNAME = pop (@HOSTNAME_ARRAY);
-$DOMAINNAME = pop (@HOSTNAME_ARRAY) . '.' . $DOMAINNAME;
-my $SHORT_HOSTNAME = shift (@HOSTNAME_ARRAY);
+my @HOSTNAME_ARRAY = split (/\./, $HOSTNAME);
+
+my ($DOMAINNAME, $SHORT_HOSTNAME);
+
+if (@HOSTNAME_ARRAY >= 3) {
+    $DOMAINNAME = pop (@HOSTNAME_ARRAY);
+    $DOMAINNAME = pop (@HOSTNAME_ARRAY) . '.' . $DOMAINNAME;
+    $SHORT_HOSTNAME = shift (@HOSTNAME_ARRAY);
+}
+elsif (@HOSTNAME_ARRAY == 2) {
+    $SHORT_HOSTNAME = $HOSTNAME_ARRAY[0];
+    $DOMAINNAME = $HOSTNAME_ARRAY[1];
+}
+else {
+    $SHORT_HOSTNAME = $HOSTNAME_ARRAY[0];
+    $DOMAINNAME = '';  # will be overridden by -k if specified
+}
+
+# Warn rather than die if domain can't be determined - -k may override it
+if (!$DOMAINNAME) {
+    print "Warning: Cannot determine domain name from hostname '$HOSTNAME'.\n";
+    print "Use -k to specify signing key explicitly.\n";
+}
 
 my $SIGNIFY_PUB_KEY_DIR = '/etc/signify';
 my $SIGNIFY_KEY_NAME = "$DOMAINNAME-$year-pkg";
@@ -231,6 +254,13 @@ my $OPENBSD_MIN_VERSION = "$current_openbsd";
 
 my $THREE_SPACES = '   ';
 
+my %PKG_VARS = (
+    'VARBASE'    => '/var',
+    'PREFIX'     => '/usr/local',
+    'LOCALBASE'  => '/usr/local',
+    'SYSCONFDIR' => '/etc',
+);
+
 ### Variables.
 
 my ($securelevel, $host, $domain, $syslock_group, @files, $file,
@@ -238,9 +268,10 @@ my ($securelevel, $host, $domain, $syslock_group, @files, $file,
     $installed_something, $temp_dir);
 my (@grp_files, @errors);
 my %opts;
-my $use_syslock = 1;
-my $force_flag = 0;
+my $custom_key_option;
 my $debug_flag = 0;
+my $force_flag = 0;
+my $use_syslock = 1;
 
 ### Main program.
 
@@ -257,7 +288,7 @@ my $debug_flag = 0;
 # 10. Update CHANGELOG.
 
 # Check options.
-getopts ('fndV', \%opts) || exit;
+getopts ('dfk:nV', \%opts) || exit;
 
 # -V version
 if ($opts{'V'}) {
@@ -266,14 +297,66 @@ if ($opts{'V'}) {
 }
 
 $force_flag = $opts{'f'};
+$custom_key_option = $opts{'k'};
 $use_syslock = 0 if ($opts{'n'});
 $debug_flag = $opts{'d'};
 
 die "Cannot use -f and -n, they are mutually exclusive.\n" if ($opts{'f'} && $opts{'n'});
 
 if ($#ARGV != -1) {
-    die "Usage: install.pl [-f (force)|-n (no syslock)|-V (version)|-d debug]\n";
+    die "Usage: install.pl [-f (force)|-k key|-n (no syslock)|-V (version)|-d debug]\n";
 }
+
+# Handle custom key option.
+if ($custom_key_option) {
+    my $custom_key_name = $custom_key_option;
+    $custom_key_name =~ s/\.(pub|sec)$//;  # strip extension if given
+    
+    my $custom_pub_key = "$SIGNIFY_PUB_KEY_DIR/$custom_key_name.pub";
+    die "Custom public key not found: $custom_pub_key\n" unless (-r $custom_pub_key);
+    
+    # Override key variables
+    $SIGNIFY_KEY_NAME = $custom_key_name;
+    $SIGNIFY_PUB_KEY = $custom_pub_key;
+    $SIGNIFY_SEC_KEY = "$SIGNIFY_PUB_KEY_DIR/$custom_key_name.sec";
+    
+    # Try to derive domain from key name for plain/custom file verification,
+    # but don't require it - non-standard key names are accepted with a warning.
+    if ($custom_key_name =~ /^([\w\.\-]+)-\d+-pkg$/) {
+        $DOMAINNAME = $1;
+        # Rebuild prior/next year key paths with new domain
+        $PRIOR_SIGNIFY_KEY_NAME = "$DOMAINNAME-$prev_year-pkg";
+        $PRIOR_SIGNIFY_SEC_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.sec";
+        $PRIOR_SIGNIFY_PUB_KEY = "$SIGNIFY_PUB_KEY_DIR/$PRIOR_SIGNIFY_KEY_NAME.pub";
+        $SIGNIFY_KEY_NAME_NEXT = "$DOMAINNAME-$next_year-pkg";
+        $SIGNIFY_PUB_KEY_NEXT = "$SIGNIFY_PUB_KEY_DIR/$SIGNIFY_KEY_NAME_NEXT.pub";
+        print "DEBUG: Derived domain from key: $DOMAINNAME\n" if ($debug_flag);
+    }
+    else {
+        print "Warning: key '$custom_key_name' doesn't follow domain-year-pkg pattern.\n";
+        print "Plain/custom file verification will require user prompt for alternate keys.\n";
+        # $DOMAINNAME left as hostname-derived (may be wrong on this network)
+        # but that only affects plain/custom file auto-accept logic
+    }
+    
+    print "DEBUG: Using custom key: $SIGNIFY_KEY_NAME\n" if ($debug_flag);
+}
+# Otherwise check domain name.
+if (!$custom_key_option) {
+    # No -k specified, domain was derived from hostname
+    if (!$DOMAINNAME) {
+        die "Cannot determine domain name from hostname '$HOSTNAME'. " .
+            "Use -k to specify signing key explicitly.\n";
+    }
+    die "Invalid domain name: $DOMAINNAME\n" 
+        unless ($DOMAINNAME =~ /^[\w.-]+$/);
+}
+# If -k was specified, domain either came from key name (good)
+# or couldn't be derived (non-standard key, prompting will handle it)
+
+# Always validate SHORT_HOSTNAME if we have one
+die "Invalid host name: $SHORT_HOSTNAME\n" 
+    if ($SHORT_HOSTNAME && $SHORT_HOSTNAME !~ /^[\w.-]+$/);
 
 # Set up signal handlers to force re-locking END block.
 $SIG{INT} = $SIG{TERM} = sub { die "Caught SIG$_[0], aborting.\n" };
@@ -669,11 +752,6 @@ sub minimal_pkg_add {
 
     # Get content of +CONTENTS file and validate.
     if ($content = $tar->get_content ('+CONTENTS')) {
-	# Verify that it's got a PLIST comment and has a matching @name.
-	if ($content !~ /^\@comment .OpenBSD: PLIST/m) {
-	    print "No \"\@comment\" PLIST found in +CONTENTS file for $file.\n";
-	    return 0;
-	}
 	if ($content !~ /^\@name \Q$file_minus_tgz\E$/m) {
 	    print "No \"\@name $file_minus_tgz\" found in +CONTENTS file for $file.\n";
 	    return 0;
@@ -796,6 +874,7 @@ sub minimal_pkg_add {
 	}
 	elsif ($line =~ /^\@sample (.*)$/) {
 	    $sample_file = $1;
+	    $sample_file = expand_pkg_vars ($sample_file);  # expand ${VARBASE} etc.
 	    if (!valid_filepath ($sample_file)) {
 		die "Aborting due to unusual \@sample file path in $file +CONTENTS. $line\n";
 	    }
@@ -1017,10 +1096,10 @@ sub valid_filepath {
     # reject paths with null bytes
     return 0 if ($path =~ /\0/);
 
-    # no odd characters (just alphanumeric, underscore, dot, slash, plus, at-sign, tilde, parens, space)
-    # this covers all packages I have installed; only one has parens and a space.
+    # no odd characters (just alphanumeric, underscore, dot, slash, plus, at-sign, tilde, parens, space)    
+    # this covers all packages I have installed; only one has parens and a space.                           
     return 0 if ($path !~ /^[\w\-\.\/\+\@~\(\) ]+$/);
-
+    
     return 1;
 }
 
@@ -1506,6 +1585,13 @@ sub verify_and_extract_package {
     }
 
     return (@output);
+}
+
+# Subroutine to expand package variables.
+sub expand_pkg_vars {
+    my ($path) = @_;
+    $path =~ s/\$\{(\w+)\}/$PKG_VARS{$1} \/\/ "\${$1}"/ge;
+    return $path;
 }
 
 # Prompt user to accept an alternate signing key.
