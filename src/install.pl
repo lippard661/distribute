@@ -137,7 +137,8 @@
 # Modified 16 September 2026 by Jim Lippard to gracefully handle one or two component
 #    hostnames (as might be observed on macOS when not in home location) and allow
 #    -k custom key specification. Remove requirement for PLIST comment in packages.
-#    Allow common variable substitutions in @sample lines.
+#    Allow common variable substitutions in @sample lines. Support @mode lines with
+#    no mode specified (return to defaults).
 use strict;
 use warnings;
 use Archive::Tar;
@@ -867,6 +868,11 @@ sub minimal_pkg_add {
 	    }
 	    $current_mode = $mode;
 	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
+	}
+	elsif ($line =~ /^\@mode\s*$/) {
+	    # @mode with no argument resets to default mode
+	    $current_mode = 0755;
+	    print "DEBUG: resetting mode to default (0755)\n" if ($debug_flag);
 	}
 	# timestamps
 	elsif ($line =~ /^\@ts (\d+)$/) {
