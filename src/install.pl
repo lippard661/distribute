@@ -138,7 +138,7 @@
 #    hostnames (as might be observed on macOS when not in home location) and allow
 #    -k custom key specification. Remove requirement for PLIST comment in packages.
 #    Allow common variable substitutions in @sample lines. Support @mode lines with
-#    no mode specified (return to defaults).
+#    no mode specified (return to defaults), allow special mode bits.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -343,7 +343,7 @@ if ($custom_key_option) {
     print "DEBUG: Using custom key: $SIGNIFY_KEY_NAME\n" if ($debug_flag);
 }
 # Otherwise check domain name.
-if (!$custom_key_option) {
+elsif (!$custom_key_option) {
     # No -k specified, domain was derived from hostname
     if (!$DOMAINNAME) {
         die "Cannot determine domain name from hostname '$HOSTNAME'. " .
@@ -361,12 +361,6 @@ die "Invalid host name: $SHORT_HOSTNAME\n"
 
 # Set up signal handlers to force re-locking END block.
 $SIG{INT} = $SIG{TERM} = sub { die "Caught SIG$_[0], aborting.\n" };
-
-# Die if weird characters in domain name.
-die "Invalid domain name: $DOMAINNAME\n" unless ($DOMAINNAME =~ /^[\w.-]+$/);
-
-# Die if weird characters in $SHORT_HOSTNAME.
-die "Invalid host name: $SHORT_HOSTNAME\n" unless ($SHORT_HOSTNAME =~ /^[\w.-]+$/);
 
 # Die if non-root
 die "Error. Must be run by root.\n" if ($> != 0);
@@ -672,9 +666,6 @@ sub relock_groups {
             print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
             system ($SYSLOCK, '-g', $syslock_group);
         }
-#        else {
-#            print "DEBUG: $syslock_group was already unlocked, not re-locking\n" if ($debug_flag);
-#        }
     }
 }
 
@@ -855,16 +846,12 @@ sub minimal_pkg_add {
 	    }
 	}
 	# mode settings
+	# In @mode parsing - just validate and store, no special bit check here
 	elsif ($line =~ /^\@mode\s+(\S+)$/) {
-	    # Convert octal string to number
 	    my $mode = oct($1);
-	    # Reject setuid/setgid/sticky bits
-	    if ($mode & 07000) {
-		die "Aborting: special mode bits not allowed in \@mode: $1\n";
-	    }
-	    # Reject world-writeable
+	    # Reject world-writeable regardless of file type
 	    if ($mode & 0002) {
-		die "Aborting: world-writeable mode not allowed: $1\n";
+		die "Aborting: world-writeable mode not allowed in \@mode: $1\n";
 	    }
 	    $current_mode = $mode;
 	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
@@ -921,12 +908,7 @@ sub minimal_pkg_add {
 	
 	# Set mode on directory if we have one recorded
 	if (defined($dir_mode{$dir})) {
-	    if (!chmod($dir_mode{$dir}, $full_path)) {
-		print "DEBUG: could not set mode " . sprintf("%04o", $dir_mode{$dir}) . " on directory $full_path. $!\n" if ($debug_flag);
-	    }
-	    elsif ($debug_flag) {
-		print "DEBUG: set mode " . sprintf("%04o", $dir_mode{$dir}) . " on directory $full_path\n";
-	    }
+	    apply_mode($dir_mode{$dir}, $full_path, 1);
 	}
     }
 
@@ -941,12 +923,7 @@ sub minimal_pkg_add {
 	    # Set mode on file if we have one recorded
 	    if (defined($file_mode{$file_extracted})) {
 		my $full_path = "$DIR_PREFIX/$file_extracted";
-		if (!chmod($file_mode{$file_extracted}, $full_path)) {
-		    print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$file_extracted}) . " on file $full_path. $!\n" if ($debug_flag);
-		}
-		elsif ($debug_flag) {
-		    print "DEBUG: set mode " . sprintf("%04o", $file_mode{$file_extracted}) . " on file $full_path\n";
-		}
+		apply_mode($file_mode{$file_extracted}, $full_path, 0);
 	    }
 	}
 	print "Installed package $file.\n";
@@ -965,12 +942,7 @@ sub minimal_pkg_add {
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = "$DIR_PREFIX/$substitute_extract{$substitute_file}";
-			    if (!chmod($file_mode{$substitute_line}, $full_path)) {
-				print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path. $!\n" if ($debug_flag);
-			    }
-			    elsif ($debug_flag) {
-				print "DEBUG: set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path\n";
-			    }
+			    apply_mode($file_mode{$substitute_line}, $full_path, 0);
 			}
 		    }
 		    if ($substitute_macos) {
@@ -979,12 +951,7 @@ sub minimal_pkg_add {
 			# Set mode on substituted file
 			if (defined($file_mode{$substitute_line})) {
 			    my $full_path = $substitute_extract{$substitute_file};
-			    if (!chmod($file_mode{$substitute_line}, $full_path)) {
-				print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path. $!\n" if ($debug_flag);
-			    }
-			    elsif ($debug_flag) {
-				print "DEBUG: set mode " . sprintf("%04o", $file_mode{$substitute_line}) . " on file $full_path\n";
-			    }
+			    apply_mode($file_mode{$substitute_line}, $full_path, 0);
 			}
 		    }
 		}
@@ -1047,12 +1014,7 @@ sub minimal_pkg_add {
 		# Set mode on sample file
 		if (defined($file_mode{$samples_to_extract{$tar_source}})) {
 		    my $full_path = $samples_to_extract{$tar_source};
-		    if (!chmod($file_mode{$samples_to_extract{$tar_source}}, $full_path)) {
-			print "DEBUG: could not set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$tar_source}}) . " on sample file $full_path. $!\n" if ($debug_flag);
-		    }
-		    elsif ($debug_flag) {
-			print "DEBUG: set mode " . sprintf("%04o", $file_mode{$samples_to_extract{$tar_source}}) . " on sample file $full_path\n";
-		    }
+		    apply_mode($file_mode{$samples_to_extract{$tar_source}}, $full_path, 0);
 		}
 	    }
 	    else {
@@ -1087,6 +1049,33 @@ sub minimal_pkg_add {
     }
     print "Couldn't extract files from package tar file $file\n" if ($debug_flag);
     return 0;
+}
+
+# Subroutine to apply a mode to given files.
+sub apply_mode {
+    my ($mode, $path, $is_dir) = @_;
+    
+    if ($is_dir) {
+        # Directories: allow sticky (01000) and setgid (02000), reject setuid (04000)
+        if ($mode & 04000) {
+            die "Aborting: setuid bit not allowed on directory $path\n";
+        }
+    }
+    else {
+        # Files: reject all special bits
+        if ($mode & 07000) {
+            die "Aborting: special mode bits not allowed on file $path\n";
+        }
+    }
+    
+    if (!chmod($mode, $path)) {
+        print "DEBUG: could not set mode " . sprintf("%04o", $mode) . 
+              " on " . ($is_dir ? "directory" : "file") . " $path. $!\n" if ($debug_flag);
+    }
+    else {
+        print "DEBUG: set mode " . sprintf("%04o", $mode) . 
+              " on " . ($is_dir ? "directory" : "file") . " $path\n" if ($debug_flag);
+    }
 }
 
 # Subroutine to determine if a string is a valid file path.
