@@ -149,6 +149,14 @@
 #    to modify ipv6-prefix to rewrite larger prefixes within the changing
 #    prefix delegation (and attempt to do so for /56-/60 transitions for
 #    longer prefixes that aren't orphaned).
+# Modified 24 September 2026 by Claude Opus 4.8 at the direction of Jim
+#    Lippard to implement only-files custom var.
+#    Any file can be in either a skip-files list or an only-files list, not
+#    both. For skip-files, the hosts for which a file is listed do not get
+#    that file; hosts and files not mentioned are unaffected. For only-files,
+#    once a file is referenced it becomes an allow list for that file: it
+#    goes to only those hosts with an only-files entry for it, and is skipped
+#    on all others. A file not referenced in only-files is unaffected by it.
 
 use strict;
 use warnings;
@@ -167,7 +175,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.7a of 8 August 2026.';
+my $VERSION = 'distribute.pl version 1.8 of 24 September 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -1306,7 +1314,7 @@ sub _custom_doas_dot_conf {
 
 # Generic engine for custom string-substitution across a set of files:
 # stages each source into the fake dir, applies a per-file substitution
-# callback, honors skip-files and require-source-dir, detects no-ops, and
+# callback, honors skip-files, only-files, and require-source-dir, detects no-ops, and
 # packages the result. The substitution itself (what "old" and "new" mean,
 # and how they're matched) is entirely in $substitute_cb, so new custom
 # types (e.g. ipv6-prefix) reuse this by passing a different callback.
@@ -1317,7 +1325,8 @@ sub _custom_doas_dot_conf {
 sub _custom_substitute_files {
     my ($temp_dir, $custom_vars, $file, $dest, $substitute_cb, $label, @hosts) = @_;
     my (%custom_vars, @source_paths, @dest_paths,
-        $host, $idx, $source_path, $dest_path, %skip_file_hash);
+        $host, $idx, $source_path, $dest_path,
+	%skip_file_hash, %only_file_hash, %only_governed);
     # global: $have_fake_dir, %host_package_files, $dest_file, $dest_dir
 
     %custom_vars = %{$custom_vars};
@@ -1355,6 +1364,39 @@ sub _custom_substitute_files {
         }
     }
 
+    # If only-files is defined, turn it into a hash of hashes and record
+    # which dest basenames it governs. only-files is a per-file allow list:
+    # once a file is named here it goes ONLY to the listed hosts and is
+    # skipped on all others. A file never named here is unaffected by it.
+    # A file may appear in skip-files OR only-files, never both.
+    if (defined ($custom_vars{'only-files'})) {
+        my @only_file_values = split (/\&/, $custom_vars{'only-files'});
+
+        my @dest_file_basenames;
+        foreach my $dp (@dest_paths) {
+            push (@dest_file_basenames, basename ($dp));
+        }
+
+        foreach my $only_file_value (@only_file_values) {
+            (my $only_host, my $only_file) = split (/:/, $only_file_value, 2);
+            die "Malformed only-files entry (need host:destfile): $only_file_value\n"
+                unless (defined $only_host && length $only_host
+                        && defined $only_file && length $only_file);
+            die "Undefined host $only_host in only-files custom-var value $only_file_value.\n"
+                if (!grep { $_ eq $only_host } @hosts);
+            die "Undefined dest file basename $only_file in only-files entry: $only_file_value\n"
+                unless (grep { $_ eq $only_file } @dest_file_basenames);
+            $only_file_hash{$only_host}{$only_file} = 1;
+            $only_governed{$only_file} = 1;
+        }
+
+        # A file governed by only-files must not also appear in skip-files.
+        foreach my $f (keys %only_governed) {
+            die "File $f appears in both skip-files and only-files; a file must use one or the other.\n"
+                if (grep { exists $skip_file_hash{$_}{$f} } keys %skip_file_hash);
+        }
+    }
+
     foreach $host (@hosts) {
         for ($idx = 0; $idx <= $#source_paths; $idx++) {
             $source_path = $source_paths[$idx];
@@ -1362,6 +1404,9 @@ sub _custom_substitute_files {
             ($dest_file, $dest_dir) = fileparse ($dest_path);
             # skip if defined in $skip_file_hash
             next if (defined ($skip_file_hash{$host}{$dest_file}));
+            # only-files: if this file is governed and this host isn't listed, skip
+            next if ($only_governed{$dest_file}
+                     && !$only_file_hash{$host}{$dest_file});
             $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
             # $HOST is special-cased (substituted at execution time).
             if ($source_path =~ /\$HOST/) {
@@ -1407,7 +1452,8 @@ sub _custom_ip_address {
                                'wan0-host-fqdn' => 'optional', # FQDN of WAN
                                'wan1-host-fqdn' => 'optional', # FQDN of WAN
                                'require-source-dir' => 'optional', # config file source location
-                               'skip-files' => 'optional', # host:file&host&file
+                               'skip-files' => 'optional', # host:file&host:file
+			       'only-files' => 'optional', # host:file&host:file
                                'ipv6-name' => 'optional', # name of IPv6 provider
 			       'ipv6-type' => 'optional', # tunnel, prefix delegation, or other
 			       'ipv6-endpoint' => 'optional', # wan0 or wan1
@@ -1631,7 +1677,8 @@ sub _custom_ipv6_prefix {
 			       'wan0-prefix-file' => 'optional', # dhcpleased /var/run/db/dhcp6leased/<interface>, backup has old one
                                'wan1-prefix-file' => 'optional',
                                'require-source-dir' => 'optional', # source of config files
-                               'skip-files' => 'optional'); # host:file&host:file
+                               'skip-files' => 'optional',  # host:file&host:file
+			       'only-files' => 'optional'); # host:file&host:file
 
     _custom_validate_custom_vars ('ipv6-prefix', $custom_vars, %REQ_OPT_CUSTOM_VARS);
 
