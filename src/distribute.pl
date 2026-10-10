@@ -157,6 +157,36 @@
 #    once a file is referenced it becomes an allow list for that file: it
 #    goes to only those hosts with an only-files entry for it, and is skipped
 #    on all others. A file not referenced in only-files is unaffected by it.
+# Modified 10 October 2026 by Jim Lippard to update version_parse from latest
+#    update in install.pl-1.8.
+# Modified 10 October 2026 by Claude Opus 5.5 at the direction of Jim Lippard
+#    (version 1.9) to fix issues from a security/correctness review:
+#    December next-year-key warning never fired (regex tested the year,
+#    not the month); ip-address substitution matched inside longer
+#    addresses (1.2.3.4 inside 11.2.3.45) and could substitute the literal
+#    string "null" if no old address was found and return was hit; old
+#    address lookup could return an IPv6 address; reject leading-zero
+#    octets; substituted files now keep their source mode instead of
+#    getting umask defaults; ipv6-prefix accepted an invalid new prefix
+#    length instead of re-prompting, died on in-file addresses outside the
+#    old delegation, and rejected valid 1-character hextets;
+#    find_package died comparing flavored versions (version_parse can't
+#    parse "-no_x11"), now compares versions only and dies if the newest
+#    version exists in more than one flavor; package .grp files contained
+#    syslock groups accumulated from every earlier file for that host, now
+#    each package gets only its own groups; doas.conf generation checks
+#    gendoas.pl's exit status and output and writes with -o into the fake
+#    dir, so the local host's doas.conf is staged in $INSTALL_DIR/<host>
+#    like any other (requires gendoas.pl 1.6, which always respects -o,
+#    and checks its version before running it for the local host;
+#    earlier versions overwrote the live /etc/doas.conf for their own
+#    host); create_package checks chdir, rename, and write;
+#    files staged into $INSTALL_DIR/<host> are removed if the run aborts
+#    before shipping; signal handlers so END cleanup runs and terminal echo
+#    is restored; EOF on interactive prompts dies instead of looping
+#    forever; config validation of host names, absolute dest paths, and
+#    matching file/dest counts; substitute-file sources without $HOST are
+#    now processed instead of silently ignored; -k rejects paths.
 
 use strict;
 use warnings;
@@ -175,7 +205,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-my $VERSION = 'distribute.pl version 1.8 of 24 September 2026.';
+my $VERSION = 'distribute.pl version 1.9 of 10 October 2026.';
 
 my $INSTALL_DIR = '/var/install';
 my $PKG_DIR = '/usr/ports/packages/amd64/all';
@@ -279,8 +309,22 @@ my %syslock_groups;
 # Signify errors.
 my @errors;
 
+# Files this run created in $INSTALL_DIR/<host>/, removed by cleanup() if
+# the run aborts before shipping starts (otherwise an aborted run could
+# leave packages in the local host's dir for install.pl to pick up).
+my @created_install_files;
+my $shipping_started = 0;
+
+# Set while terminal echo is off for the passphrase prompt.
+my $echo_off = 0;
+
 # End block to clean up temp files and wipe passphrase from memory if used.
-END { cleanup(); }
+# "local $?" because cleanup() may call system(), which would otherwise
+# overwrite the exit status.
+END { local $?; cleanup(); }
+
+# Make INT/TERM/HUP run the END block (default action skips it).
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { die "Caught SIG$_[0], aborting.\n" };
 
 ### Main program.
 
@@ -360,6 +404,7 @@ if (defined($CONFIG{_GLOBAL}{PKG_DIR})) {
 
 # Select signing key for plain/custom files
 if ($custom_key_option) {
+    die "-k takes a key name in $SIGNIFY_PUB_KEY_DIR, not a path: $custom_key_option\n" if ($custom_key_option =~ m{/});
     $signing_key_name = $custom_key_option;
     $signing_key_name .= '.sec' unless ($signing_key_name =~ /\.sec$/);
     $signing_sec_key = "$SIGNIFY_PUB_KEY_DIR/$signing_key_name";
@@ -448,7 +493,8 @@ $date = strftime ("%Y%m%d-%H%M%S", localtime (time()));
 print "DEBUG: getting date: $date\n" if ($debug_flag);
 
 # Warn about missing next year signing key if month is December.
-if (!-e $SIGNIFY_PUB_KEY_NEXT && $date =~ /^..12/) {
+# $date is YYYYMMDD-HHMMSS, so the month is characters 5-6.
+if (!-e $SIGNIFY_PUB_KEY_NEXT && $date =~ /^\d{4}12/) {
     print "Warning: Next year's signing key and public key $SIGNIFY_PUB_KEY_NEXT do not exist.\n";
 }
 
@@ -547,13 +593,19 @@ foreach $file (@files) {
     # Complain/die if -h selected no hosts.
     die "No selected hosts match for file $file. @selected_hosts\n" if ($host_option && @process_hosts == 0);
     
-    # Accumulate syslock groups.
-    foreach $host (@process_hosts){
-	print "DEBUG: processing syslock groups for host $host\n" if ($debug_flag);
-	(@{$syslock_groups{$host}}) = add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host}});
+    # Accumulate syslock groups for the per-host plain/custom bundle. Each
+    # package gets its own .grp with only its own groups (below), so
+    # packages don't contribute here and don't inherit groups from
+    # earlier files.
+    if ($CONFIG{$file}{TYPE} ne 'package') {
+	foreach $host (@process_hosts){
+	    print "DEBUG: processing syslock groups for host $host\n" if ($debug_flag);
+	    (@{$syslock_groups{$host}}) = add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS}, @{$syslock_groups{$host} // []});
+	}
     }
 
     if ($CONFIG{$file}{TYPE} eq 'package') {
+	my @pkg_syslock_groups = add_syslock_groups ($CONFIG{$file}{SYSLOCKGROUPS});
 	# Look for most up-to-date package in $PKG_DIR.
 	$package_path = find_package ($PKG_DIR, $CONFIG{$file}{FILE});
 	print "DEBUG: processing package $package_path\n" if ($debug_flag);
@@ -575,9 +627,9 @@ foreach $file (@files) {
 	    $host_package_path{$host} = "$INSTALL_DIR/$host/$dest_file";
 
 	    # Create syslock group file if any syslock groups specified.
-            if (@{$syslock_groups{$host}}) {
+            if (@pkg_syslock_groups) {
                 print "DEBUG: creating syslock group file for package $dest_file for $host\n" if ($debug_flag);
-                print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
+                print "DEBUG: \@pkg_syslock_groups = @pkg_syslock_groups\n" if ($debug_flag);
                 
                 # Get passphrase if not already obtained (may not have
                 # plain/custom files that would normally trigger this).
@@ -586,7 +638,8 @@ foreach $file (@files) {
                 }
                 
                 my $grp_file = "$host_package_path{$host}.grp";
-                create_syslock_group_file ($grp_file, @{$syslock_groups{$host}});
+                push (@created_install_files, grep { !-e $_ } ($grp_file, "$grp_file.sig"));
+                create_syslock_group_file ($grp_file, @pkg_syslock_groups);
                 # Sign it.
                 if (!Signify::sign ($grp_file, $signify_passphrase, $signing_sec_key)) {
                     @errors = Signify::signify_error();
@@ -631,11 +684,12 @@ foreach $file (@files) {
 	}
     }
     elsif ($CONFIG{$file}{TYPE} eq 'custom') {
-	# Make sure file exists. (Ignore filenames with commas.)
+	# Make sure file exists. (Ignore filenames with commas or $HOST; the
+	# substitute-files engine checks each expanded source.)
 	# With commas should probably split it out and check for all, but
 	# will have to do $HOST substitution and check all relevant
 	# instances.
-	die "File in config can't be found. $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE} && $CONFIG{$file}{FILE} !~ /,/);
+	die "File in config can't be found. $CONFIG{$file}{FILE}\n" if (!-e $CONFIG{$file}{FILE} && $CONFIG{$file}{FILE} !~ /,|\$HOST/);
 	print "DEBUG: processing custom file $file\n" if ($debug_flag);
 
 	# Each is separate, for now. There may end up being some different
@@ -688,7 +742,7 @@ foreach $host (keys (%host_package_files)) {
     push (@files_to_ship_and_remove, copy_package ($host_package_path{$host}, $host));
 
     # Create syslock group file if any syslock groups are specified.
-    if (@{$syslock_groups{$host}}) {
+    if (@{$syslock_groups{$host} // []}) {
 	print "DEBUG: creating syslock group file for $host\n" if ($debug_flag);
 	print "DEBUG: \@{\$syslock_groups{\$host}} = @{$syslock_groups{$host}}\n" if ($debug_flag);
 	create_syslock_group_file ("$host_package_path{$host}.grp", @{$syslock_groups{$host}});
@@ -716,6 +770,9 @@ if (!@files_to_ship_and_remove) {
 # them.
 my $had_errors = 0;
 my @failed_hosts;
+# From here on, staged files are either shipped and removed (remote) or
+# intentionally left for install.pl (local), so cleanup() leaves them alone.
+$shipping_started = 1;
 foreach $host (keys (%host_package_path)) {
     @rsync_file_list = ();
     foreach $package_path (@files_to_ship_and_remove) {
@@ -781,11 +838,23 @@ exit 0;
 
 # Cleanup, called from END block.
 sub cleanup {
+    system ($STTY, 'echo') if ($echo_off);
+    if (!$shipping_started) {
+	foreach my $f (@created_install_files) {
+	    unlink ($f) if (-e $f);
+	}
+    }
     if (defined ($signify_passphrase)) {
 	$signify_passphrase = "x" x length ($signify_passphrase); # overwrite memory
 	$signify_passphrase = '';
     }
-    rmtree($temp_dir) if (defined $temp_dir && -d $temp_dir);
+    # rmtree refuses to remove a tree containing the cwd, which after a die
+    # is often a fake dir inside $temp_dir (before 1.9 the temp dir was
+    # left behind on any die after create_package or doas.conf processing).
+    if (defined $temp_dir && -d $temp_dir) {
+	chdir ('/');
+	rmtree($temp_dir);
+    }
 }
 
 # Subroutine to parse config file.
@@ -846,6 +915,13 @@ sub parse_config {
 		die "A \"host-list:\" field in file context on line $line_no. $_\n" if ($context == $FILE_CONTEXT);
 		die "A second \"host-list:\" field on line $line_no. $_\n" if (@host_list);
 		@host_list = split (/,\s*/, $value);
+		# Host names become path components ($INSTALL_DIR/<host>,
+		# $temp_dir/<host>) and the start of the rsync destination, so
+		# no slashes, no "..", no leading "-".
+		foreach $host (@host_list) {
+		    die "Invalid host name \"$host\" in \"host-list:\" on line $line_no. $_\n"
+			unless ($host =~ /^[A-Za-z0-9][\w.-]*$/ && $host !~ /\.\./);
+		}
 		push (@HOSTS, @host_list); # global like %CONFIG
 	    }
 	    elsif ($field eq 'syslock-groups-list') {
@@ -917,6 +993,11 @@ sub parse_config {
 		}
 		elsif ($current_name eq "$DOMAINNAME-pkg.pub-next") {
 		    $value = $SIGNIFY_PUB_KEY_NEXT if ($value eq '$SIGNIFY_PUB_KEY_NEXT');
+		}
+		# Dest paths are made relative by stripping the leading slash;
+		# a relative dest would lose its first character.
+		foreach my $dp (split (/,/, $value)) {
+		    die "A \"dest:\" path must be absolute, \"$dp\" on line $line_no. $_\n" unless ($dp =~ m{^/});
 		}
 		$CONFIG{$current_name}{DEST} = $value;
 		$got_dest = 1; # optional; forbidden for package type
@@ -1022,12 +1103,25 @@ sub parse_config {
     # syslock-groups should always be optional.
 #    die "No \"syslock-groups:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_syslock_groups);
     die "No \"hosts:\" defined for \"name:\" $current_name before next \"name:\" on line $line_no. $_\n" if (!$got_hosts);
+
+    # Multi-file custom entries pair file: and dest: lists one to one;
+    # check now rather than after the interactive prompts.
+    foreach my $name (keys %CONFIG) {
+	next if ($name eq '_GLOBAL' || ($CONFIG{$name}{TYPE} // '') ne 'custom');
+	next unless ($CONFIG{$name}{FILE} =~ /,/);
+	my @f = split (/,/, $CONFIG{$name}{FILE});
+	my $n_file = scalar (@f);
+	my @d = split (/,/, $CONFIG{$name}{DEST} // '');
+	my $n_dest = scalar (@d);
+	die "Config for \"$name\" has $n_file file: entries but $n_dest dest: entries; they must match one to one.\n"
+	    if ($n_file != $n_dest);
+    }
 }
 
 # Subroutine to find a package.
 sub find_package {
     my ($pkg_dir, $pkg_start) = @_;
-    my (@files, $file, $version, $check_version, $pkg_path);
+    my (@files, $file, @candidates, $best, @tied);
 
     if ($pkg_start =~ /^(.*)-PKG$/) {
 	$pkg_start = $1;
@@ -1040,25 +1134,34 @@ sub find_package {
     @files = grep (!/^\.{1,2}$/, readdir ($dir_fh));
     closedir ($dir_fh);
 
-    foreach $file (@files) {
-	if ($file =~ /^\Q$pkg_start\E-([\w\.]+)\.tgz$/ || $file =~ /^\Q$pkg_start\E-([\w\.]+-no_[\w]+)\.tgz$/) {
-	    # This currently matches python-tkinter-xxx and not just
-	    # python-xxx. Is it safe to restrict $1 to numbers, letters,
-	    # and periods, and exclude hyphens? i.e., ([\w\.]+)
-	    # instead of (.*)?
-	    $check_version = $1;
-	    
-	    if (!defined ($version)) {
-		$version = $check_version;
-	    }
-	    elsif (version_gt ($check_version, $version)) {
-		$version = $check_version;
-	    }
+    # [\w.]+ excludes hyphens, so python-PKG doesn't match
+    # python-tkinter-3.x. An optional -no_xxx flavor is captured
+    # separately: version_parse can't parse "30.1p0-no_x11", so only the
+    # version part is compared.
+    foreach $file (sort @files) {
+	if ($file =~ /^\Q$pkg_start\E-([\w\.]+)(-no_\w+)?\.tgz$/) {
+	    push (@candidates, { file => $file, version => $1, flavor => $2 // '' });
 	}
     }
-    die "Could not find $pkg_start package in $PKG_DIR.\n" if (!$version);
-    $pkg_path = $PKG_DIR . '/' . $pkg_start . '-' . $version . '.tgz';
-    return ($pkg_path);
+    die "Could not find $pkg_start package in $pkg_dir.\n" if (!@candidates);
+
+    # A single candidate is returned without parsing its version.
+    return ("$pkg_dir/$candidates[0]{file}") if (@candidates == 1);
+
+    $best = $candidates[0];
+    foreach my $c (@candidates[1..$#candidates]) {
+	$best = $c if (version_gt ($c->{version}, $best->{version}));
+    }
+
+    # The newest version in more than one flavor (e.g. emacs-30.1p0.tgz and
+    # emacs-30.1p0-no_x11.tgz) is ambiguous; don't guess.
+    @tied = grep { !version_gt ($best->{version}, $_->{version}) } @candidates;
+    if (@tied > 1) {
+	die "Ambiguous package for $pkg_start-PKG in $pkg_dir, newest version in more than one flavor: "
+	    . join (', ', map { $_->{file} } @tied) . "\n";
+    }
+
+    return ("$pkg_dir/$best->{file}");
 }
 
 # Returns 1 if $version1 > $version2.
@@ -1123,6 +1226,8 @@ sub version_gt {
     return 0; # equal
 }
 
+# Subroutine used in both distribute.pl and install.pl, be sure to keep
+# consistent.
 # Parses versions.
 # maj.min.pat(pN)(vN) (Many OpenBSD ports: 3.11.10p0, 9.20.8p0v3, 9.20.9v3)
 # maj.min(alpha)(pN) (reportnew, py3-packaging)
@@ -1151,7 +1256,9 @@ sub version_parse {
 	$portrevision = $4 if (defined ($4));
     }
     # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
-    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]?)(p\d+)?(v\d+)?$/) {
+    # ([a-o])? not ([a-o]?): the latter captures '' (defined) when there is
+    # no alpha, which made any vN here die as "both an alpha patch and vN".
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o])?(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
@@ -1191,9 +1298,12 @@ sub get_signify_passphrase {
     
     # Get signify passphrase.
     system ($STTY, '-echo');
+    $echo_off = 1;
     print "signify passphrase: ";
     $signify_passphrase = <STDIN>;
     system ($STTY, 'echo');
+    $echo_off = 0;
+    die "\nNo passphrase entered (EOF).\n" unless (defined ($signify_passphrase));
     print "\n"; # newline after silent input
     chomp ($signify_passphrase) if (defined ($signify_passphrase));
     return ($signify_passphrase);
@@ -1204,11 +1314,16 @@ sub copy_package {
     my ($pkg_path, @hosts) = @_;
     my ($host, $file_basename, @ship_files);
 
+    $file_basename = basename($pkg_path);
     foreach $host (@hosts) {
-	copy ($pkg_path, "$INSTALL_DIR/$host/")
+	my $dst = "$INSTALL_DIR/$host/$file_basename";
+	# Track only files this run creates, so an abort doesn't remove a
+	# file left by an earlier run that is still waiting for install.pl.
+	my $preexisting = -e $dst;
+	copy ($pkg_path, $dst)
 	    || die "Failed to copy $pkg_path to $INSTALL_DIR/$host: $!\n";
-	$file_basename = basename($pkg_path);
-	push (@ship_files, "$INSTALL_DIR/$host/$file_basename");
+	push (@created_install_files, $dst) unless ($preexisting);
+	push (@ship_files, $dst);
     }
     
     return (@ship_files);
@@ -1220,8 +1335,17 @@ sub create_package {
     my ($have_fake_dir, $temp_dir, $date, $host, @file_list) = @_;
     my ($pkg_path, $file, $file_wo_slash);
 
+    # Relative entries in @file_list live under $temp_dir/$host. A host
+    # with only absolute paths may have no fake dir even when another
+    # host does; go to / so a failed chdir can't leave us in some other
+    # host's fake dir.
     if ($have_fake_dir) {
-	chdir ("$temp_dir/$host");
+	if (-d "$temp_dir/$host") {
+	    chdir ("$temp_dir/$host") || die "Cannot chdir to $temp_dir/$host. $!\n";
+	}
+	else {
+	    chdir ('/') || die "Cannot chdir to /. $!\n";
+	}
     }
 
     $pkg_path = "$temp_dir/$host-$date-package.tgz";
@@ -1234,6 +1358,8 @@ sub create_package {
     # STDERR to /dev/null to avoid the error message about stripping the initial /.
     # The module won't extract with a leading slash so we need to remove them.
     my $tar = Archive::Tar->new;
+    # Relative paths (fake-dir files) are read from the cwd set above.
+    # Absolute paths are read from the real filesystem.
     my @added = $tar->add_files (@file_list);
     if (@added != @file_list) {
 	die "Failed to add all files to package for $host: got "
@@ -1243,11 +1369,15 @@ sub create_package {
     foreach $file (@file_list) {
 	$file_wo_slash = $file;
 	$file_wo_slash =~ s/^\///;
+	next if ($file_wo_slash eq $file);
 	if (!$tar->rename ($file, $file_wo_slash)) {
-	    print "Unable to rename $file to $file_wo_slash in tar file.\n";
+	    die "Unable to rename $file to $file_wo_slash in tar file. " . $tar->error . "\n";
 	}
     }
-    $tar->write ($pkg_path, COMPRESS_GZIP);
+    # An unchecked partial write (e.g. /tmp full) would get signed and
+    # shipped as a truncated archive.
+    $tar->write ($pkg_path, COMPRESS_GZIP)
+	|| die "Failed to write package $pkg_path for $host. " . $tar->error . "\n";
 
     return ($pkg_path);
 }
@@ -1261,6 +1391,7 @@ sub make_fake_dir {
 
     return if (-d "$temp_dir/$host$dest_dir");
     system ($MKDIR, '-p', "$temp_dir/$host$dest_dir");
+    die "Cannot create $temp_dir/$host$dest_dir.\n" unless (-d "$temp_dir/$host$dest_dir");
 }
 
 ### Custom packages.
@@ -1270,7 +1401,8 @@ sub _custom_validate_custom_vars {
     my ($file, $custom_vars, %req_opt_custom_vars) = @_;
     my (%custom_vars, $custom_var);
 
-    %custom_vars = %{$custom_vars};
+    # No custom-vars: line at all leaves this undef.
+    %custom_vars = %{$custom_vars // {}};
 
     foreach $custom_var (keys (%req_opt_custom_vars)) {
 	die "Config is missing required custom variable \"$custom_var\" for $file.\n" if (!defined ($custom_vars{$custom_var}) && $req_opt_custom_vars{$custom_var} eq 'required');
@@ -1301,13 +1433,37 @@ sub _custom_doas_dot_conf {
 
     die "Cannot find $GENDOAS.\n" if (!-e $GENDOAS);
 
+    die "doas.conf dest must be an absolute path: $dest_path\n" unless (defined ($dest_path) && $dest_path =~ m{^/});
     ($dest_file, $dest_dir) = fileparse ($dest_path);
-    $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
+    $dest_path =~ s{^/+}{};
 #    $have_fake_dir = 1; # done after call to this subroutine
+    # The local host requires gendoas.pl 1.6 or later: earlier versions
+    # ignore -o for their own host name and overwrite the live
+    # /etc/doas.conf. Check the version before running it for this host.
+    if (grep { $_ eq $SHORT_HOSTNAME } @hosts) {
+	my $gendoas_version = '';
+	if (open (my $v_fh, '-|', $PERL, $GENDOAS, '-V')) {
+	    $gendoas_version = <$v_fh> // '';
+	    close ($v_fh);
+	}
+	if ($gendoas_version !~ /version (\d+)\.(\d+)/ || $1 < 1 || ($1 == 1 && $2 < 6)) {
+	    chomp ($gendoas_version);
+	    die "$GENDOAS is too old to generate doas.conf for local host $SHORT_HOSTNAME (need 1.6+, it would overwrite /etc/doas.conf): '$gendoas_version'\n";
+	}
+    }
+
     foreach $host (@hosts) {
 	make_fake_dir ($temp_dir, $dest_dir, $host);
-	chdir ("$temp_dir/$host$dest_dir");
-	system ($PERL, $GENDOAS, $host);
+	my $out = "$temp_dir/$host/$dest_path";
+	chdir ("$temp_dir/$host$dest_dir") || die "Cannot chdir to $temp_dir/$host$dest_dir. $!\n";
+	system ($PERL, $GENDOAS, '-o', $out, $host);
+	if ($? == -1) {
+	    die "Could not run $PERL $GENDOAS: $!\n";
+	}
+	elsif ($? != 0) {
+	    die "$GENDOAS failed for $host (" . (($? & 127) ? 'signal ' . ($? & 127) : 'exit ' . ($? >> 8)) . "); not distributing doas.conf.\n";
+	}
+	die "$GENDOAS produced no output for $host at $out.\n" unless (-s $out);
 	push (@{$host_package_files{$host}}, $dest_path);
     }
 }
@@ -1341,7 +1497,13 @@ sub _custom_substitute_files {
 
     # Do this early so that skip-files can use @dest_paths for validation.
     @source_paths = split (/,/, $file);
-    @dest_paths = split (/,/, $dest);
+    @dest_paths = split (/,/, $dest // '');
+    die "Config for $label substitution has " . scalar (@source_paths) . " file: entries but "
+	. scalar (@dest_paths) . " dest: entries; they must match one to one.\n"
+	if (@source_paths != @dest_paths);
+    foreach my $dp (@dest_paths) {
+	die "Config dest path for $label substitution must be absolute: $dp\n" unless ($dp =~ m{^/});
+    }
 
     # If skip-files is defined, turn it into a hash of hashes.
     if (defined ($custom_vars{'skip-files'})) {
@@ -1407,34 +1569,35 @@ sub _custom_substitute_files {
             # only-files: if this file is governed and this host isn't listed, skip
             next if ($only_governed{$dest_file}
                      && !$only_file_hash{$host}{$dest_file});
-            $dest_path = substr ($dest_path, 1, length ($dest_path) - 1);
+            $dest_path =~ s{^/+}{};
             # $HOST is special-cased (substituted at execution time).
-            if ($source_path =~ /\$HOST/) {
-                $source_path =~ s/\$HOST/$host/;
-                if (!-e $source_path) {
-                    die "Source path missing, can use /var/db/servers if urgent: $source_path\n";
-                }
-
-                make_fake_dir ($temp_dir, $dest_dir, $host);
-                cp ($source_path, "$temp_dir/$host/$dest_path")
-                    || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
-
-                my $changed = $substitute_cb->("$temp_dir/$host/$dest_path");
-
-                if (!$changed) {
-                    warn "No $label substitutions in $dest_path for $host; skipping (no-op for this host).\n";
-                    unlink ("$temp_dir/$host/$dest_path");
-                    next; # skip this host for this file
-                }
-
-                # Manually remove g and o read permissions. Must occur AFTER
-                # the substitution, which recreates the file with default perms.
-                if ($dest_path =~ /\/pf\.conf$/) {
-                    system ($CHMOD, 'go-r', "$temp_dir/$host/$dest_path");
-                }
-
-                push (@{$host_package_files{$host}}, $dest_path);
+            # A source without $HOST is the same file for every host.
+            # (Before 1.9 such a source was silently never processed.)
+            $source_path =~ s/\$HOST/$host/;
+            if (!-e $source_path) {
+                die "Source path missing, can use /var/db/servers if urgent: $source_path\n";
             }
+
+            make_fake_dir ($temp_dir, $dest_dir, $host);
+            cp ($source_path, "$temp_dir/$host/$dest_path")
+                || die "Failed to copy $source_path to $temp_dir/$host/$dest_path: $!\n";
+
+            my $changed = $substitute_cb->("$temp_dir/$host/$dest_path");
+
+            if (!$changed) {
+                warn "No $label substitutions in $dest_path for $host; skipping (no-op for this host).\n";
+                unlink ("$temp_dir/$host/$dest_path");
+                next; # skip this host for this file
+            }
+
+            # The substitution subroutines now preserve the source mode;
+            # this stays as a backstop so pf.conf is never group/other
+            # readable even if the source copy was.
+            if ($dest_path =~ /\/pf\.conf$/) {
+                system ($CHMOD, 'go-r', "$temp_dir/$host/$dest_path");
+            }
+
+            push (@{$host_package_files{$host}}, $dest_path);
         }
     }
 }
@@ -1486,7 +1649,7 @@ sub _custom_ip_address {
 # Returns $new_rsync_host_suffix up for $rsync_host_suffix to be changed in main.
 sub _custom_get_old_and_new_ip_addresses {
     my ($wan0_host_fqdn, $wan1_host_fqdn, $ipv6_name, $ipv6_type, $ipv6_endpoint, $dns, $wan0, $wan1) = @_;
-    use Socket qw( :addrinfo SOCK_RAW );
+    use Socket qw( :addrinfo SOCK_RAW AF_INET );
     my ($have_ipv6, $old_address, $new_address, $wan0_or_wan1,
 	$lc_wan0, $lc_wan1, $host_fqdn);
     my $new_rsync_host_suffix;
@@ -1523,9 +1686,7 @@ sub _custom_get_old_and_new_ip_addresses {
 
     while ($wan0_or_wan1 eq 'null') {
 	print "$wan0 or $wan1? ";
-	$wan0_or_wan1 = <STDIN>;
-	chomp ($wan0_or_wan1);
-	$wan0_or_wan1 = lc ($wan0_or_wan1);
+	$wan0_or_wan1 = lc (read_line_or_die());
 	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
     }
 
@@ -1576,33 +1737,33 @@ sub _custom_get_old_and_new_ip_addresses {
     }
     while (1) {
 	print "Old address: $old_address (return or enter correct): ";
-	my $input_string = <STDIN>;
-	chomp ($input_string);
-	if ($input_string =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-	    && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) {
+	my $input_string = read_line_or_die();
+	if (_valid_ipv4 ($input_string)) {
 	    $old_address = $input_string;
 	    last;
 	}
-	elsif ($input_string eq '') {
-	    $input_string = $old_address;
+	# Return accepts the looked-up address only if it is a real address;
+	# otherwise the literal "null" would be substituted in every file.
+	elsif ($input_string eq '' && _valid_ipv4 ($old_address)) {
 	    last;
 	}
+	elsif ($input_string eq '') {
+	    print "No old address was found; enter it.\n";
+	}
 	else {
-	    print "Invalid response \"$input_string\". Enter new IP or hit return.\n";
+	    print "Invalid response \"$input_string\". Enter old IP or hit return.\n";
 	}
     }
-    
+
     $new_address = 'null';
     while ($new_address eq 'null') {
-    	  print "New IP Address: ";
-    	  $new_address = <STDIN>;
-    	  chomp ($new_address);
-	  $new_address = 'null' unless ($new_address =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-					&& $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255);
-	  if ($new_address eq $old_address) {
-	      print "New address $new_address is the same as old address $old_address. Try again.\n";
-	      $new_address = 'null';
-	  }
+	print "New IP Address: ";
+	$new_address = read_line_or_die();
+	$new_address = 'null' unless (_valid_ipv4 ($new_address));
+	if ($new_address eq $old_address) {
+	    print "New address $new_address is the same as old address $old_address. Try again.\n";
+	    $new_address = 'null';
+	}
     }
     
     return ($old_address, $new_address, $new_rsync_host_suffix);
@@ -1613,21 +1774,38 @@ sub _get_wan_ip {
     my ($host_fqdn) = @_;
     my ($old_address, $err, @res, $ai);
 
-    ($err, @res) = getaddrinfo ($host_fqdn, "", {socktype => SOCK_RAW});
-    if ($err) {
-	print "Cannot getaddrinfo - $err";
-	$old_address = 'null';
-	return ($old_address);
+    # AF_INET: without it a WAN name with an AAAA record could return an
+    # IPv6 address here, offered as the default old address. Use the first
+    # result (the old loop kept the last).
+    ($err, @res) = getaddrinfo ($host_fqdn, "", {family => AF_INET, socktype => SOCK_RAW});
+    if ($err || !@res) {
+	print "Cannot getaddrinfo for $host_fqdn - " . ($err || 'no IPv4 address') . "\n";
+	return ('null');
     }
-    while ( $ai = shift @res ) {
-	($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
-	if ($err) {
-	    print "Cannot getnameinfo - $err";
-	    $old_address = 'null';
-	    return ($old_address);
-	}
+    $ai = $res[0];
+    ($err, $old_address) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+    if ($err) {
+	print "Cannot getnameinfo for $host_fqdn - $err\n";
+	return ('null');
     }
     return ($old_address);
+}
+
+# Strict dotted-quad IPv4: four octets 0-255, no leading zeros (010 could
+# be read as octal by some parsers).
+sub _valid_ipv4 {
+    my ($address) = @_;
+    my $octet = qr/(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/;
+    return (defined ($address) && $address =~ /^$octet\.$octet\.$octet\.$octet$/);
+}
+
+# Read one line from STDIN, chomped. Dies on EOF instead of letting the
+# prompt loops spin forever on undef.
+sub read_line_or_die {
+    my $line = <STDIN>;
+    die "\nEnd of input at prompt, aborting.\n" unless (defined ($line));
+    chomp ($line);
+    return ($line);
 }
 
 # Subroutine to do global string replacement on a given file.
@@ -1651,14 +1829,21 @@ sub _custom_global_replace_in_file {
     rename ($file, $backup_file) || die "Cannot rename $file to $backup_file. $!\n";
     open (my $infile_fh, '<', $backup_file) || die "Cannot open file. $backup_file $!\n";
     open (my $outfile_fh, '>', $file) || die "Cannot open file for writing. $file $!\n";
+    # Keep the source file's mode; the new file would otherwise get umask
+    # defaults (e.g. 0644 for a 0600 or 0640 file).
+    my $mode = (stat ($infile_fh))[2] & 07777;
+    chmod ($mode, $outfile_fh) || die "Cannot set mode on $file. $!\n";
     my $changed = 0;
+    # Bounded so 1.2.3.4 doesn't match inside 11.2.3.45 or 1.2.3.45: not
+    # preceded by a digit or dot, not followed by a digit or .digit (for
+    # the dot-escaped form, not followed by a digit or \.digit).
     while (<$infile_fh>) {
-	$changed += s/\Q$string\E/$replace/g;
-	$changed += s/\Q$dot_escaped_string\E/$dot_escaped_replace/g if ($dot_escape);
+	$changed += s/(?<![\d.])\Q$string\E(?!\.?\d)/$replace/g;
+	$changed += s/(?<![\d.])\Q$dot_escaped_string\E(?!\d|\\\.\d)/$dot_escaped_replace/g if ($dot_escape);
 	print $outfile_fh $_;
     }
     close ($infile_fh);
-    close ($outfile_fh);
+    close ($outfile_fh) || die "Error writing $file. $!\n";
     unlink ($backup_file);
     return ($changed); # did anything change?
 }
@@ -1733,9 +1918,7 @@ sub _custom_get_old_and_new_ip6_prefixes {
 
     while ($wan0_or_wan1 eq 'null') {
 	print "$wan0 or $wan1? ";
-	$wan0_or_wan1 = <STDIN>;
-	chomp ($wan0_or_wan1);
-	$wan0_or_wan1 = lc ($wan0_or_wan1);
+	$wan0_or_wan1 = lc (read_line_or_die());
 	$wan0_or_wan1 = 'null' unless ($wan0_or_wan1 eq $lc_wan0 || $wan0_or_wan1 eq $lc_wan1);
     }
 
@@ -1757,11 +1940,10 @@ sub _custom_get_old_and_new_ip6_prefixes {
     my $old_prefix_len;
     while (1) {
 	print "Old prefix: $old_prefix (return or enter correct): ";
-	my $input_string = <STDIN>;
-	chomp ($input_string);
+	my $input_string = read_line_or_die();
 	$input_string = $old_prefix if ($input_string eq '');
-	if ($input_string =~ /^((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4})::\/(\d{2})$/) {
-	    $old_prefix_body = $1;
+	if ($input_string =~ /^((?:[0-9a-fA-F]{1,4}:){3}[0-9a-fA-F]{1,4})::\/(\d{2})$/) {
+	    $old_prefix_body = lc ($1);
 	    $old_prefix_len = $2;
 	    last if ($old_prefix_len == 56 || $old_prefix_len == 60);
 	    warn "Invalid prefix length $old_prefix_len, must be 56 or 60.\n";
@@ -1775,18 +1957,21 @@ sub _custom_get_old_and_new_ip6_prefixes {
     my $new_prefix_body;
     my $new_prefix_len;
     while ($new_prefix eq 'null') {
-    	  print "New prefix: ";
-    	  $new_prefix = <STDIN>;
-    	  chomp ($new_prefix);
-	  if ($new_prefix =~ /^((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4})::\/(\d{2})$/) {
-	      $new_prefix_body = $1;
+	  print "New prefix: ";
+	  $new_prefix = read_line_or_die();
+	  if ($new_prefix =~ /^((?:[0-9a-fA-F]{1,4}:){3}[0-9a-fA-F]{1,4})::\/(\d{2})$/) {
+	      $new_prefix_body = lc ($1);
 	      $new_prefix_len = $2;
-	      if ($new_prefix_body eq $old_prefix_body && $new_prefix_len == $old_prefix_len) {
+	      # Compare normalized hextets so 2001:DB8:: equals 2001:db8:: and
+	      # 2001:0db8:: equals 2001:db8::.
+	      if (_ipv6_norm ($new_prefix_body) eq _ipv6_norm ($old_prefix_body) && $new_prefix_len == $old_prefix_len) {
 		  print "New IPv6 prefix $new_prefix is the same as old prefix $old_prefix. Try again.\n";
 		  $new_prefix = 'null';
 	      }
 	      elsif ($new_prefix_len != 56 && $new_prefix_len != 60) {
+		  # Re-prompt (before 1.9 the loop exited with the bad length).
 		  warn "Invalid prefix length $new_prefix_len, must be 56 or 60. $new_prefix\n";
+		  $new_prefix = 'null';
 	      }
 	  }
 	  else {
@@ -1818,16 +2003,22 @@ sub _ipv6_decompose_prefix {
     die "Internal error: canonical prefix \"$prefix\" does not have 4 hextets.\n"
         unless (@hextets == 4);
 
-    my $h123 = join (':', @hextets[0..2]);
+    my $h123 = _ipv6_norm (join (':', @hextets[0..2])); # canonical: lowercase, no leading zeros
     my $h4   = hex ($hextets[3]);
     my $h4top = $h4 & _ipv6_h4_prefix_mask ($len);   # zero the host bits
 
     return ($h123, $h4top);
 }
 
+# Normalize "h1:h2:h3:h4" hextets (lowercase, no leading zeros) for comparison.
+sub _ipv6_norm {
+    my ($body) = @_;
+    return (join (':', map { sprintf ('%x', hex ($_)) } split (/:/, $body)));
+}
+
 # Subroutine to obtain an IPv6 prefix from a file such as a dhcp6leased file (/var/db/dhcp6leased/<interface-name>).
 # Format can also be a CIDR-format IPv6 prefix.
-# Assumes 2-4 characters per hextet and four hextets.
+# Assumes 1-4 characters per hextet and four hextets.
 sub _custom_get_prefix_delegation {
     my ($file) = @_;
 
@@ -1838,11 +2029,11 @@ sub _custom_get_prefix_delegation {
 
     my $prefix_len;
     # dhcp6leased file, we only look at the first delegated prefix.
-    if ($prefix =~ /^ia_pd \d ((?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4}::) (\d{2})$/) {
+    if ($prefix =~ /^ia_pd \d ((?:[0-9a-fA-F]{1,4}:){3}[0-9a-fA-F]{1,4}::) (\d{2})$/) {
 	$prefix = "$1/$2";
 	$prefix_len = $2;
     }
-    elsif ($prefix =~ /^(?:[0-9a-fA-F]{2,4}:){3}[0-9a-fA-F]{2,4}::\/(\d{2})$/) {
+    elsif ($prefix =~ /^(?:[0-9a-fA-F]{1,4}:){3}[0-9a-fA-F]{1,4}::\/(\d{2})$/) {
 	$prefix_len = $1; # just capture length, $prefix is OK if the length is OK.
     }
     else {
@@ -1883,6 +2074,9 @@ sub _custom_ipv6_substitute_in_file {
     rename ($file, $bak) || die "Cannot rename $file to $bak. $!\n";
     open (my $in,  '<', $bak)  || die "Cannot open $bak. $!\n";
     open (my $out, '>', $file) || die "Cannot open $file. $!\n";
+    # Keep the source file's mode (see _custom_global_replace_in_file).
+    my $mode = (stat ($in))[2] & 07777;
+    chmod ($mode, $out) || die "Cannot set mode on $file. $!\n";
 
     while (my $line = <$in>) {
         my $before = $line;
@@ -1894,8 +2088,8 @@ sub _custom_ipv6_substitute_in_file {
             my $h4 = hex ($1);
             (($h4 & $old_mask) == $old_h4top)
               ? sprintf ("%s:%x::/%d", $new_h123, $new_h4top, $new_len)
-              : "$old_h123:$1\::/$old_len";
-        }gex);
+              : $&;
+        }gexi);
 
         # PASS 1b: in-prefix CIDRs LONGER than the delegation (e.g. /64s under
         # the /60). Rewrite the delegation prefix bits, preserve the
@@ -1906,34 +2100,40 @@ sub _custom_ipv6_substitute_in_file {
             \Q$old_h123\E : ([0-9a-fA-F]{1,4}) :: / (\d+) \b
         }{
             my ($h4, $nn) = (hex ($1), $2);
-            if    ($nn <= $old_len)                        { "$old_h123:$1\::/$nn"; }
-            elsif (($h4 & $old_mask) != $old_h4top)        { "$old_h123:$1\::/$nn"; }
+            if    ($nn <= $old_len)                        { $&; }
+            elsif (($h4 & $old_mask) != $old_h4top)        { $&; }
             elsif (($h4 & $newly) != ($new_h4top & $newly)) {
                 warn sprintf ("Orphaned /%d under prefix: %s:%x::/%d falls outside "
                             . "new /%d delegation; left unchanged.\n",
                               $nn, $old_h123, $h4, $nn, $new_len);
-                "$old_h123:$1\::/$nn";
+                $&;
             }
             else {
                 my $sub = $h4 & $new_host_mask;
                 sprintf ("%s:%x::/%d", $new_h123, ($new_h4top | $sub), $nn);
             }
-        }gex);
+        }gexi);
 
         # PASS 2: prefix embedded in a full address.
         ($line =~ s{
             \Q$old_h123\E : ([0-9a-fA-F]{1,4}) \b (?! :* / \d)
         }{
             my $h4 = hex ($1);
-            if (($h4 & $newly) != ($new_h4top & $newly)) {
+            # Only addresses inside the old delegation are rewritten (or
+            # can be orphaned); others sharing hextets 1-3 are left alone.
+            # Before 1.9 the orphan check ran first and could die on them.
+            if (($h4 & $old_mask) != $old_h4top) {
+                $&;
+            }
+            elsif (($h4 & $newly) != ($new_h4top & $newly)) {
                 die sprintf ("Address hextet-4 %#x has subnet bits that would be "
                            . "lost narrowing /%d -> /%d; manual renumbering required.\n",
                              $h4, $old_len, $new_len);
             }
-            (($h4 & $old_mask) == $old_h4top)
-              ? sprintf ("%s:%x", $new_h123, ($new_h4top | ($h4 & $new_host_mask)))
-              : "$old_h123:$1";
-        }gex);
+            else {
+                sprintf ("%s:%x", $new_h123, ($new_h4top | ($h4 & $new_host_mask)));
+            }
+        }gexi);
 
         $changed++ if ($line ne $before);
         print $out $line;
@@ -1943,7 +2143,7 @@ sub _custom_ipv6_substitute_in_file {
         }
     }
     close ($in);
-    close ($out);
+    close ($out) || die "Error writing $file. $!\n";
     unlink ($bak);
     return $changed;
 }

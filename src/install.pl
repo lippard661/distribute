@@ -139,11 +139,24 @@
 #    -k custom key specification. Remove requirement for PLIST comment in packages.
 #    Allow common variable substitutions in @sample lines. Support @mode lines with
 #    no mode specified (return to defaults), allow special mode bits.
+# Modified 10 October 2026 by Jim Lippard after Claude review to close TOCTOU
+#    windows by staging files from the install dir into the private temp dir
+#    (O_NOFOLLOW, regular files only) and verifying/installing from the copy;
+#    validate new package +CONTENTS before deleting the old package; fail
+#    closed on unparseable securelevel (and treat -1 as insecure); preserve
+#    exit status in END and remove temp dir there; warn loudly on re-lock
+#    failure; catch SIGHUP; distinguish sysunlock run failures from audit
+#    results and re-run failed audits verbosely; run all schg/sappnd
+#    pre-checks before unlocking anything; expand pkg vars in @sample on
+#    delete; fix perl module mode lookup and synthesized perl lib dir modes;
+#    fix yyyy.mmdd+vN version parsing; check chdir; write CHANGELOG before
+#    re-locking; reject paths in -k; validate .grp group names; require
+#    /usr/bin/perl on macOS.
 use strict;
 use warnings;
 use Archive::Tar;
 use Cwd;
-use Fcntl ':mode'; # For S_ISREG
+use Fcntl qw(:mode O_RDONLY O_NOFOLLOW O_NONBLOCK); # S_ISREG; flags for stage_file
 use File::Basename qw(fileparse basename dirname);
 use File::Copy qw(copy);
 use File::Path qw(rmtree make_path);
@@ -164,7 +177,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.7 of 16 September 2026.';
+my $VERSION = 'install.pl version 1.8 of 10 October 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -215,11 +228,8 @@ else {
     $DOMAINNAME = '';  # will be overridden by -k if specified
 }
 
-# Warn rather than die if domain can't be determined - -k may override it
-if (!$DOMAINNAME) {
-    print "Warning: Cannot determine domain name from hostname '$HOSTNAME'.\n";
-    print "Use -k to specify signing key explicitly.\n";
-}
+# If the domain can't be determined, -k may supply it; without -k we die
+# with that advice after option processing.
 
 my $SIGNIFY_PUB_KEY_DIR = '/etc/signify';
 my $SIGNIFY_KEY_NAME = "$DOMAINNAME-$year-pkg";
@@ -308,11 +318,21 @@ if ($#ARGV != -1) {
     die "Usage: install.pl [-f (force)|-k key|-n (no syslock)|-V (version)|-d debug]\n";
 }
 
+# On macOS, the perl module install path is derived from the version of the
+# perl running this script ($^V). Our perl scripts use /usr/bin/perl, so
+# running under another perl (e.g., Homebrew's, via "perl install.pl") would
+# install modules where system perl never looks, and load a different
+# Signify.pm.
+die "On macOS install.pl must run under /usr/bin/perl (running $^X).\n"
+    if ($^O eq 'darwin' && $^X !~ m{^/usr/bin/perl});
+
 # Handle custom key option.
 if ($custom_key_option) {
     my $custom_key_name = $custom_key_option;
     $custom_key_name =~ s/\.(pub|sec)$//;  # strip extension if given
-    
+    die "-k takes a key name in $SIGNIFY_PUB_KEY_DIR, not a path: $custom_key_option\n"
+	if ($custom_key_name =~ m{/});
+
     my $custom_pub_key = "$SIGNIFY_PUB_KEY_DIR/$custom_key_name.pub";
     die "Custom public key not found: $custom_pub_key\n" unless (-r $custom_pub_key);
     
@@ -359,8 +379,10 @@ elsif (!$custom_key_option) {
 die "Invalid host name: $SHORT_HOSTNAME\n" 
     if ($SHORT_HOSTNAME && $SHORT_HOSTNAME !~ /^[\w.-]+$/);
 
-# Set up signal handlers to force re-locking END block.
-$SIG{INT} = $SIG{TERM} = sub { die "Caught SIG$_[0], aborting.\n" };
+# Set up signal handlers to force re-locking END block. HUP matters for
+# -f runs over ssh: a dropped session would otherwise kill us without
+# running END, leaving unlocked groups unlocked.
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { die "Caught SIG$_[0], aborting.\n" };
 
 # Die if non-root
 die "Error. Must be run by root.\n" if ($> != 0);
@@ -396,23 +418,23 @@ if ($month == 12 && $day > 16 && !-e $SIGNIFY_PUB_KEY_NEXT) {
 }
 
 # Obtain securelevel if using syslock (but don't abort if -f force_flag is used).
+# Fail closed: anything that isn't an integer is an error, not securelevel 0.
+# -1 (permanently insecure) and 0 (insecure) both allow clearing schg/sappnd.
 if ($use_syslock && ($^O eq 'openbsd' || $^O eq 'darwin'|| $^O =~ /bsd$/)) {
-    if (open (my $sysctl_fh, '-|', $SYSCTL, 'kern.securelevel')) {
-	$securelevel = <$sysctl_fh>;
+    if (open (my $sysctl_fh, '-|', $SYSCTL, '-n', 'kern.securelevel')) {
+	my $sysctl_out = <$sysctl_fh>;
 	close ($sysctl_fh);
-	chomp ($securelevel);
-	if ($^O eq 'darwin') {
-	    $securelevel =~ s/kern\.securelevel:\s*(\d+)/$1/;
-	}
-	else {
-	    $securelevel =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
-	}
-	if ($securelevel != 0 && !$force_flag) {
-	    die "Cannot unlock immutable files and directories for installation while system securelevel >=0. Securelevel: $securelevel.\n";
+	$sysctl_out = '' unless (defined ($sysctl_out));
+	chomp ($sysctl_out);
+	die "Unexpected kern.securelevel output from $SYSCTL: '$sysctl_out'\n"
+	    unless ($sysctl_out =~ /^-?\d+$/);
+	$securelevel = $sysctl_out;
+	if ($securelevel > 0 && !$force_flag) {
+	    die "Cannot unlock immutable files and directories for installation while system securelevel > 0. Securelevel: $securelevel.\n";
 	}
     }
     else {
-	die "Cannot get system securelevel. Output: $securelevel. $!\n";
+	die "Cannot run $SYSCTL to get system securelevel. $!\n";
     }
     print "DEBUG: securelevel=$securelevel\n" if ($debug_flag);
 }
@@ -459,6 +481,13 @@ if ($^O eq 'openbsd') {
     unveil ();
 }
 
+# Create temp dir. Created early because files from $INSTALL_DIR (which
+# other accounts can write to) are staged into it before verification, and
+# it's also used for signature verification and for altering package
+# +CONTENTS files for minimal_pkg_add. mkdtemp creates it mode 0700.
+$temp_dir = mkdtemp ('/tmp/install.XXXXXXX') || die "Could not create temp dir. $!\n";
+chomp ($temp_dir);
+
 $installed_something = 0;
 
 # Check $INSTALL_DIR for contents; if any, then unlock.
@@ -470,6 +499,8 @@ closedir ($dir_fh);
 
 if ($use_syslock) {
     # Add any signed .grp files to syslock groups to unlock/lock.
+    # The group file and its signature are staged into the private temp dir
+    # first, so the copy we verify is the copy we read.
     @grp_files = grep (/\.grp$/, @files);
     @files = grep (!/\.grp$/, @files);
     foreach $file (@grp_files) {
@@ -478,19 +509,25 @@ if ($use_syslock) {
 	}
 	# If signature verifies, add syslock groups and remove sig file.
 	else {
+	    my $staged_grp = stage_file ("$INSTALL_DIR/$file");
+	    my $staged_sig = stage_file ("$INSTALL_DIR/$file.sig");
 	    # Verify.
-	    if (Signify::verify ("$INSTALL_DIR/$file", $SIGNIFY_PUB_KEY) ||
-		Signify::verify ("$INSTALL_DIR/$file", $PRIOR_SIGNIFY_PUB_KEY)) {
-		open (my $fh, '<', "$INSTALL_DIR/$file") || die "Cannot open syslock group file. $! $INSTALL_DIR/$file\n";
+	    if ($staged_grp && $staged_sig &&
+		(Signify::verify ($staged_grp, $SIGNIFY_PUB_KEY) ||
+		 Signify::verify ($staged_grp, $PRIOR_SIGNIFY_PUB_KEY))) {
+		open (my $fh, '<', $staged_grp) || die "Cannot open syslock group file. $! $staged_grp\n";
 		while (<$fh>) {
 		    chomp;
 		    my $group = $_; # grep overwrites $_ for its own ends
+		    next if ($group eq '');
+		    die "Invalid syslock group name \"$group\" in group file $file.\n"
+			unless ($group =~ /^[\w.-]+(?::[su](?:chg|appnd))?$/);
 		    push (@SYSLOCK_GROUPS, $group) unless (grep { $_ eq $group } @SYSLOCK_GROUPS);
 		}
 		close ($fh);
 		print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
 	    }
-	    else {
+	    elsif ($staged_grp && $staged_sig) {
 		@errors = Signify::signify_error();
 		print "Bad signature on group file. $INSTALL_DIR/$file.sig @errors";
 	    }
@@ -516,54 +553,51 @@ push (@changelog_entry, "$date-$user:");
 # Behavior: For each syslock group, check if unlocking is needed before doing
 # so. Only unlock groups that have locked entries. Track which groups we
 # unlock so we can re-lock only those at the end. When -f (force) is used
-# at elevated securelevel (BSD/macOS only), we also pre-check for schg/sappnd
-# locks that cannot be cleared, failing before any modification is made to
-# avoid leaving the system in an asymmetric state. After installation,
-# re-locking a group restores its configured state per syslock.conf - any
-# pre-existing mixed-lock anomalies will be corrected to the configured
-# state rather than preserved.
+# at elevated securelevel (BSD/macOS only), we first pre-check ALL groups for
+# schg/sappnd locks that cannot be cleared, failing before any group is
+# modified to avoid leaving the system in an asymmetric state. After
+# installation, re-locking a group restores its configured state per
+# syslock.conf - any pre-existing mixed-lock anomalies will be corrected to
+# the configured state rather than preserved.
 my %unlocked_by_us;
 
 if ($use_syslock) {
+    # Pass 1: pre-check schg/sappnd locks - only meaningful on BSD/macOS at
+    # elevated securelevel where these flags cannot be cleared.
+    if ($force_flag && $^O ne 'linux' && $securelevel > 0) {
+	foreach $syslock_group (@SYSLOCK_GROUPS) {
+	    # If group is an explicit :uchg or :uappnd, no schg/sappnd to worry about.
+	    next if ($syslock_group =~ /:uchg$|:uappnd$/);
+	    my @test_types;
+	    # Untagged group or explicit :schg -> check schg members;
+	    # untagged group or explicit :sappnd -> check sappnd members.
+	    push (@test_types, 'schg') if ($syslock_group !~ /:sappnd$/);
+	    push (@test_types, 'sappnd') if ($syslock_group !~ /:schg$/);
+	    foreach my $type (@test_types) {
+		my $test_group = $syslock_group;
+		$test_group .= ":$type" if ($syslock_group !~ /:\Q$type\E$/);
+		my $audit_code = run_sysunlock ('-g', $test_group, '-a', '-q');
+		if ($audit_code != 0) {
+		    # Re-run without -q so the output shows what was found
+		    # (or what went wrong) rather than leaving it a mystery.
+		    print "Audit of syslock group $test_group returned exit code $audit_code; re-running without -q:\n";
+		    run_sysunlock ('-g', $test_group, '-a');
+		    die "Group $syslock_group has $type-locked files that cannot be cleared at securelevel $securelevel, or the audit itself failed (exit $audit_code; see output above). Aborting before modification.\n";
+		}
+	    }
+	}
+    }
+
+    # Pass 2: unlock groups that need it.
     foreach $syslock_group (@SYSLOCK_GROUPS) {
-        # Pre-check schg/sappnd locks - only meaningful on BSD/macOS at
-        # elevated securelevel where these flags cannot be cleared.
-        if ($force_flag && $^O ne 'linux' && $securelevel > 0) {
-            # If group is an explicit :uchg or :uappnd, no schg/sappnd to worry about.
-            unless ($syslock_group =~ /:uchg$|:uappnd$/) {
-                # If untagged group or explicit :schg, check for locked schg members
-                if ($syslock_group !~ /:sappnd$/) {
-                    my $test_group = $syslock_group;
-                    $test_group = $syslock_group . ':schg' if ($syslock_group !~ /:schg$/);
-                    system ($SYSUNLOCK, '-g', $test_group, '-a', '-q');
-                    my $schg_audit_code = $? >> 8;
-                    if ($schg_audit_code != 0) {
-                        die "Group $syslock_group has active schg locks that cannot be cleared at current securelevel. Aborting before modification.\n";
-                    }
-                }
-                # If untagged group or explicit :sappnd, check for locked sappnd members
-                if ($syslock_group !~ /:schg$/) {
-                    my $test_group = $syslock_group;
-                    $test_group = $syslock_group . ':sappnd' if ($syslock_group !~ /:sappnd$/);
-                    system ($SYSUNLOCK, '-g', $test_group, '-a', '-q');
-                    my $sappnd_audit_code = $? >> 8;
-                    if ($sappnd_audit_code != 0) {
-                        die "Group $syslock_group has active sappnd locks that cannot be cleared at current securelevel. Aborting before modification.\n";
-                    }
-                }
-            }
-        }
-        
         # Check if unlock is needed at all. This is fast in the expected state
 	# when everything is locked, but slow if everything or almost everything
 	# is unlocked.
-        system ($SYSUNLOCK, '-g', $syslock_group, '-a', '-o', '-q');
-        my $needs_unlock = ($? >> 8) != 0;
-        
+        my $needs_unlock = (run_sysunlock ('-g', $syslock_group, '-a', '-o', '-q') != 0);
+
         if ($needs_unlock) {
             print "DEBUG: unlocking syslock group $syslock_group\n" if ($debug_flag);
-            system ($SYSUNLOCK, '-g', $syslock_group);
-            my $unlock_exit_code = $? >> 8;
+            my $unlock_exit_code = run_sysunlock ('-g', $syslock_group);
 
 	    if ($unlock_exit_code != 0) {
 		# Re-lock any groups we already unlocked before dying.
@@ -580,22 +614,25 @@ if ($use_syslock) {
 	    # sysunlock failure should give us a better result due to the slowness
 	    # of the post-unlock audit that delayed the installation.
         }
+	else {
+	    print "DEBUG: $syslock_group already unlocked, skipping\n" if ($debug_flag);
+	}
     }
 }
-
-# Create temp dir. Needed for signature verification and for altering
-# package +CONTENTS files for minimal_pkg_add.
-$temp_dir = mkdtemp ('/tmp/install.XXXXXXX') || die "Could not create temp dir. $!\n";
-chomp ($temp_dir);
 
 # For each file in the install dir:
 # If it is of the form <host>-<date>-<time>-package.tgz:
 #    Extract after verifying signature.
 # If it is of the form <name>-<version>.tgz or <name>-<version>-no_xxx.tgz:
 #    Install using pkg_add.
+# Each file is first staged into the private temp dir; signature
+# verification and installation both use the staged copy, so a file
+# replaced in $INSTALL_DIR mid-run can't be substituted after verification.
 foreach $file (@files) {
     if ($file =~ /^\Q$host\E-\d+-\d+-package\.tgz$/) {
-	@contents = verify_and_extract_package ("$INSTALL_DIR/$file");
+	my $staged = stage_file ("$INSTALL_DIR/$file");
+	next unless ($staged);
+	@contents = verify_and_extract_package ($staged);
 	# Remove file and create CHANGELOG entry if successfully installed.
 	if ($contents[0]) {
 	    unlink ("$INSTALL_DIR/$file");
@@ -609,23 +646,38 @@ foreach $file (@files) {
 	}
     }
     elsif ($file =~ /^([\w\-]+-[\.\w]+)\.tgz$/ || $file =~ /^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/) {
-	if (-d "/var/db/pkg/$1") {
-	    print "Package $file already installed per existence of directory /var/db/pkg/$1.\n";
+	my $pkg_name = $1;
+	if (-d "/var/db/pkg/$pkg_name") {
+	    print "Package $file already installed per existence of directory /var/db/pkg/$pkg_name.\n";
 	    unlink ("$INSTALL_DIR/$file");
 	}
-	# Remove file and create CHANGELOG entry if successfully installed.
-	elsif (install_pkg_add ("$INSTALL_DIR/$file")) {
-	    unlink ("$INSTALL_DIR/$file");
-	    
-	    # Create CHANGELOG entry.
-	    push (@changelog_entry, "\tUpgraded to $file.");
+	else {
+	    my $staged = stage_file ("$INSTALL_DIR/$file");
+	    # Remove file and create CHANGELOG entry if successfully installed.
+	    if ($staged && install_pkg_add ($staged)) {
+		unlink ("$INSTALL_DIR/$file");
 
-	    $installed_something = 1;
+		# Create CHANGELOG entry.
+		push (@changelog_entry, "\tUpgraded to $file.");
+
+		$installed_something = 1;
+	    }
 	}
     }
     else {
 	print "Extraneous file in $INSTALL_DIR. Ignoring. $file\n";
     }
+}
+
+# Update CHANGELOG before re-locking, in case it is ever placed in a
+# syslock group that we unlocked.
+if ($installed_something) {
+    open (my $fh, '>>', $CHANGELOG) || die "Cannot open $CHANGELOG for appending. $!\n";
+    print $fh "\n";
+    foreach $line (@changelog_entry) {
+	print $fh "$line\n";
+    }
+    close ($fh);
 }
 
 # Re-lock system. Only re-lock groups that we actually unlocked.
@@ -634,7 +686,7 @@ foreach $file (@files) {
 # corrected to the configured state.
 relock_groups () if ($use_syslock);
 
-# Remove temp dir.
+# Remove temp dir (and the staged copies in it).
 rmtree ($temp_dir);
 
 # End if we didn't install anything.
@@ -643,35 +695,82 @@ if (!$installed_something) {
     exit;
 }
 
-# Update CHANGELOG.
-open (my $fh, '>>', $CHANGELOG) || die "Cannot open $CHANGELOG for appending. $!\n";
-print $fh "\n";
-foreach $line (@changelog_entry) {
-    print $fh "$line\n";
-}
-close ($fh);
-
 ### Subroutines.
 
-# End block to ensure groups are relocked in cases where syslock dies while they're locked
-# Signal handler for INT and TERM catches edge cases.
+# End block to ensure groups are relocked in cases where we die while they're
+# unlocked. Signal handlers for INT, TERM, and HUP catch edge cases.
+# "local $?" is required: system() inside END would otherwise overwrite the
+# exit status, making a failed run (die) exit 0.
 END {
+    local $?;
     relock_groups() if ($use_syslock && %unlocked_by_us);
+    rmtree ($temp_dir) if (defined ($temp_dir) && -d $temp_dir);
 }
 
-# Subroutine to relock syslock groups.
+# Subroutine to relock syslock groups. A failed re-lock is reported loudly,
+# since it can leave files unlocked.
 sub relock_groups {
     foreach my $syslock_group (@SYSLOCK_GROUPS) {
         if (delete $unlocked_by_us{$syslock_group}) { # delete makes this one-shot, calling twice is no-op
             print "DEBUG: re-locking syslock group $syslock_group\n" if ($debug_flag);
             system ($SYSLOCK, '-g', $syslock_group);
+	    if ($? != 0) {
+		my $why = ($? == -1) ? "could not run $SYSLOCK: $!"
+		    : ($? & 127) ? 'killed by signal ' . ($? & 127)
+		    : 'exit ' . ($? >> 8);
+		print STDERR "WARNING: re-lock of syslock group $syslock_group FAILED ($why).\n";
+		print STDERR "WARNING: files may be left unlocked; run '$SYSLOCK -g $syslock_group' manually.\n";
+	    }
         }
     }
+}
+
+# Run sysunlock with the given arguments and return its exit code. Dies if
+# sysunlock couldn't be run or was killed by a signal, so that "couldn't run
+# the audit" is never mistaken for "the audit found locked files" (with $?
+# == -1, $? >> 8 is a huge nonzero number).
+sub run_sysunlock {
+    my (@args) = @_;
+    system ($SYSUNLOCK, @args);
+    die "Could not run $SYSUNLOCK @args: $!\n" if ($? == -1);
+    die "$SYSUNLOCK @args killed by signal " . ($? & 127) . "\n" if ($? & 127);
+    return ($? >> 8);
+}
+
+# Copy a file from $INSTALL_DIR (writable by other accounts) into the
+# private temp dir, refusing symlinks and anything that isn't a regular
+# file (O_NONBLOCK keeps a FIFO from hanging the open). Returns the staged
+# path, which keeps the original basename, or undef.
+sub stage_file {
+    my ($src) = @_;
+    my $in;
+
+    if (!sysopen ($in, $src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+	# O_NOFOLLOW on a symlink fails with ELOOP.
+	print "Skipping $src: " . ($!{ELOOP} ? 'is a symbolic link' : $!) . ".\n";
+	return undef;
+    }
+    my @st = stat ($in);
+    if (!@st || !S_ISREG ($st[2])) {
+	print "Skipping $src: not a regular file.\n";
+	close ($in);
+	return undef;
+    }
+    my $dst = "$temp_dir/" . basename ($src);
+    if (!copy ($in, $dst)) {
+	print "Couldn't stage $src to $dst. $!\n";
+	close ($in);
+	return undef;
+    }
+    close ($in);
+    print "DEBUG: staged $src as $dst\n" if ($debug_flag);
+    return ($dst);
 }
 
 # Install a package with pkg_add.
 # Should fail if not signed by a key in /etc/signify.
 # (But there's a TRUSTED_PKG_PATH bypass...)
+# $file is the staged copy in the private temp dir (see stage_file).
 sub install_pkg_add {
     my ($file) = @_;
 
@@ -686,10 +785,10 @@ sub install_pkg_add {
 	return 0; # failure
     }
 
-    # Note: there is a TOCTOU race condition here because while OpenBSD's
-    # pkg_add also checks for a signed package unless -D unsigned is
-    # used (against /etc/signify keys), it will bypass the warning from
-    # this script if it's not one of the expected signing keys.
+    # pkg_add does its own signature check (against any key in
+    # /etc/signify); because $file is our private staged copy, the
+    # package it installs is the same one verify_signature approved
+    # under this script's stricter key policy.
     print "DEBUG: installing package $file\n" if ($debug_flag);
     if (system ($PKG_ADD, $file)) {
 	return 0; # failure (system returns nonzero for failure)
@@ -700,8 +799,10 @@ sub install_pkg_add {
 }
 
 # Builtin minimal pkg_add, called after signature already verified.
-# We verify signature after the tar file has been read to mitigate
-# TOCTOU race and potential malicious archive substitution.
+# $file is the staged copy in the private temp dir (see stage_file), so the
+# bytes verified are the bytes read here; no second verification is needed.
+# The new package's +CONTENTS is fully parsed and validated BEFORE any older
+# version is deleted, so a malformed package can't leave neither installed.
 #   Look for +CONTENTS
 #      See if it's for @arch *
 #      Identify files to extract and dirs to create.
@@ -717,7 +818,7 @@ sub minimal_pkg_add {
 	$substitute_file, $substitute_linux, $substitute_macos,
 	%file_mode, %dir_mode, $current_mode);
     my $DIR_PREFIX = '/usr/local';
-    
+
     # Default mode is 0755 (rwxr-xr-x)
     $current_mode = 0755;
     my $OPENBSD_PERL = 'libdata/perl5/site_perl';
@@ -730,12 +831,6 @@ sub minimal_pkg_add {
     $tar = Archive::Tar->new;
     if (!$tar->read($file)) {
 	print "Couldn't read tar file $file. $!\n";
-	return 0;
-    }
-    
-    # Do another signify verification post-tar-read to mitigate TOCTOU race.
-    if (!verify_signature ($file, 1)) { # 1 = is_package
-	print "Invalid or missing signature. Could not install package $file.\n";
 	return 0;
     }
 
@@ -766,6 +861,109 @@ sub minimal_pkg_add {
 	return 0;
     }
 
+    # Parse +CONTENTS. Everything that can make us die or reject the
+    # package happens here, before an older version is deleted. Existence
+    # of directories is checked later, at creation time, because deleting
+    # the older version may remove directories that exist now.
+    @lines = split (/\n/, $content);
+
+    foreach $line (@lines) {
+	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
+	    # Content lines are relative to @cwd (verified /usr/local above);
+	    # an absolute path here is malformed. Reject before classifying.
+	    # NB: the macOS /Library/Perl path is *derived* by the substitution
+	    # below from a relative content line, so it never passes through here.
+	    if ($line =~ m{^/}) {
+		die "Aborting due to absolute path in $file +CONTENTS. $line\n";
+	    }
+	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
+		# Directories: allow sticky and setgid, reject setuid.
+		die "Aborting: setuid bit not allowed on directory $line in $file +CONTENTS.\n"
+		    if ($current_mode & 04000);
+		push (@dirs_to_create, $line);
+		$dir_mode{$line} = $current_mode;
+	    }
+	    elsif (valid_filepath ($line)) { # otherwise it's a file
+		# Files: reject all special bits.
+		die "Aborting: special mode bits not allowed on file $line in $file +CONTENTS.\n"
+		    if ($current_mode & 07000);
+		$last_file = $line;
+		$file_mode{$line} = $current_mode;
+		if ($line =~ /^$OPENBSD_PERL/) {
+		    $substitute_line = $line;
+		    # The perl lib dir we may create gets 0755, not the module's
+		    # file mode (a 0644 directory isn't searchable).
+		    if ($^O eq 'linux') {
+			$substitute_line =~ s/^$OPENBSD_PERL/$LINUX_PERL/;
+			$substitute_linux = 1;
+			push (@dirs_to_create, $LINUX_PERL);
+			$dir_mode{$LINUX_PERL} = 0755;
+		    }
+		    elsif ($^O eq 'darwin') {
+			$substitute_line =~ s/^$OPENBSD_PERL/$MACOS_PERL/;
+			$substitute_macos = 1;
+			push (@dirs_to_create, $MACOS_PERL);
+			$dir_mode{$MACOS_PERL} = 0755;
+		    }
+		    $substitute_extract{$line} = $substitute_line;
+		    $file_mode{$substitute_line} = $current_mode;
+		}
+		else {
+		    push (@files_to_extract, $line);
+		}
+	    }
+	    else {
+		die "Aborting due to unusual line in $file +CONTENTS. $line\n";
+	    }
+	}
+	# mode settings
+	# Special bits are checked when the mode is applied to a file or dir
+	# line above, where we know which it is.
+	elsif ($line =~ /^\@mode\s+(\S+)$/) {
+	    my $mode = oct($1);
+	    # Reject world-writeable regardless of file type
+	    if ($mode & 0002) {
+		die "Aborting: world-writeable mode not allowed in \@mode: $1\n";
+	    }
+	    $current_mode = $mode;
+	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
+	}
+	elsif ($line =~ /^\@mode\s*$/) {
+	    # @mode with no argument resets to default mode
+	    $current_mode = 0755;
+	    print "DEBUG: resetting mode to default (0755)\n" if ($debug_flag);
+	}
+	# timestamps
+	elsif ($line =~ /^\@ts (\d+)$/) {
+	    $file_ts{$last_file} = $1 if (defined ($last_file));
+	}
+	elsif ($line =~ /^\@sample (.*)$/) {
+	    $sample_file = $1;
+	    $sample_file = expand_pkg_vars ($sample_file);  # expand ${VARBASE} etc.
+	    if (!valid_filepath ($sample_file)) {
+		die "Aborting due to unusual \@sample file path in $file +CONTENTS. $line\n";
+	    }
+	    # Trailing / is a dir to create, most likely in /etc.
+	    if ($sample_file =~ /\/$/) {
+		die "Aborting: setuid bit not allowed on \@sample directory $sample_file in $file +CONTENTS.\n"
+		    if ($current_mode & 04000);
+		push (@dirs_to_create, $sample_file);
+		$dir_mode{$sample_file} = $current_mode;
+	    }
+	    # A file to extract into another location if not already present.
+	    # Will typically be last file from @files_to_extract. Key is
+	    # file in tar file, value is full path of destination.
+	    else {
+		die "Aborting: \@sample $sample_file precedes any file in $file +CONTENTS.\n"
+		    if (!defined ($last_file));
+		die "Aborting: special mode bits not allowed on \@sample file $sample_file in $file +CONTENTS.\n"
+		    if ($current_mode & 07000);
+		$samples_to_extract{$last_file} = $sample_file;
+		$file_mode{$sample_file} = $current_mode;
+	    }
+	}
+    }
+
     if (!-e $PKG_DIR) {
 	print "DEBUG: creating $PKG_DIR\n" if ($debug_flag);
 	make_path ($PKG_DIR, { error => \my $err });
@@ -774,6 +972,14 @@ sub minimal_pkg_add {
 	    return 0; # didn't get to installation
 	}
     }
+
+    # Set directory, packages extract to /usr/local. Done before deleting
+    # any older version so a failure here leaves the old version in place.
+    if (!chdir ($DIR_PREFIX)) {
+	print "Cannot chdir to $DIR_PREFIX. $! Not installing $file.\n";
+	return 0;
+    }
+    $tar->setcwd ( cwd() );
 
     # Is a prior version of this package already installed? If so, remove it,
     # but don't touch @sample dirs and files unless the files are unchanged
@@ -793,7 +999,7 @@ sub minimal_pkg_add {
 
 	# Get +DISPLAY hash.
 	$old_pkg_display_hash = get_pkg_display_hash ($older_package);
-	
+
 	print "DEBUG: deleting package $older_package with builtin minimal pkg_delete.\n" if ($debug_flag);
 	if (!minimal_pkg_delete ($older_package)) {
 	    print "Package delete of $older_package failed. Not installing $file.\n";
@@ -801,102 +1007,16 @@ sub minimal_pkg_add {
 	}
     }
 
-    # Let's look for files and attempt some extraction.
-    @lines = split (/\n/, $content);
-
-    foreach $line (@lines) {
-	if ($line !~ /^[\@\+]/) { # lines not beginning with @ or +
-	    # Content lines are relative to @cwd (verified /usr/local above);
-	    # an absolute path here is malformed. Reject before classifying.
-	    # NB: the macOS /Library/Perl path is *derived* by the substitution
-	    # below from a relative content line, so it never passes through here.
-	    if ($line =~ m{^/}) {
-		die "Aborting due to absolute path in $file +CONTENTS. $line\n";
-	    }
-	    if ($line =~ /\/$/ && valid_filepath ($line)) { # lines ending in / are dirs
-		push (@dirs_to_create, $line) unless (-e "$DIR_PREFIX/$line");
-		$dir_mode{$line} = $current_mode;
-	    }
-	    elsif (valid_filepath ($line)) { # otherwise it's a file
-		$last_file = $line;
-		$file_mode{$line} = $current_mode;
-		if ($line =~ /^$OPENBSD_PERL/) {
-		    $substitute_line = $line;
-		    if ($^O eq 'linux') {
-			$substitute_line =~ s/^$OPENBSD_PERL/$LINUX_PERL/;
-			$substitute_linux = 1;
-			push (@dirs_to_create, $LINUX_PERL) if (!-e "$DIR_PREFIX/$LINUX_PERL");
-			$dir_mode{$LINUX_PERL} = $current_mode;
-		    }
-		    elsif ($^O eq 'darwin') {
-			$substitute_line =~ s/^$OPENBSD_PERL/$MACOS_PERL/;
-			$substitute_macos = 1;
-			push (@dirs_to_create, $MACOS_PERL) if (!-e $MACOS_PERL);
-			$dir_mode{$MACOS_PERL} = $current_mode;
-		    }
-		    $substitute_extract{$line} = $substitute_line;
-		    $file_mode{$substitute_line} = $current_mode;
-		}
-		else {
-		    push (@files_to_extract, $line);
-		}
-	    }
-	    else {
-		die "Aborting due to unusual line in $file +CONTENTS. $line\n";
-	    }
-	}
-	# mode settings
-	# In @mode parsing - just validate and store, no special bit check here
-	elsif ($line =~ /^\@mode\s+(\S+)$/) {
-	    my $mode = oct($1);
-	    # Reject world-writeable regardless of file type
-	    if ($mode & 0002) {
-		die "Aborting: world-writeable mode not allowed in \@mode: $1\n";
-	    }
-	    $current_mode = $mode;
-	    print "DEBUG: setting mode to $1 (octal) = $current_mode (decimal)\n" if ($debug_flag);
-	}
-	elsif ($line =~ /^\@mode\s*$/) {
-	    # @mode with no argument resets to default mode
-	    $current_mode = 0755;
-	    print "DEBUG: resetting mode to default (0755)\n" if ($debug_flag);
-	}
-	# timestamps
-	elsif ($line =~ /^\@ts (\d+)$/) {
-	    $file_ts{$last_file} = $1;
-	}
-	elsif ($line =~ /^\@sample (.*)$/) {
-	    $sample_file = $1;
-	    $sample_file = expand_pkg_vars ($sample_file);  # expand ${VARBASE} etc.
-	    if (!valid_filepath ($sample_file)) {
-		die "Aborting due to unusual \@sample file path in $file +CONTENTS. $line\n";
-	    }
-	    # Trailing / is a dir to create, most likely in /etc.
-	    if ($sample_file =~ /\/$/) {
-		push (@dirs_to_create, $sample_file) unless (-e $sample_file);
-		$dir_mode{$sample_file} = $current_mode;
-	    }
-	    # A file to extract into another location if not already present.
-	    # Will typically be last file from @files_to_extract. Key is
-	    # file in tar file, value is full path of destination.
-	    else {
-		$samples_to_extract{$last_file} = $sample_file;
-		$file_mode{$sample_file} = $current_mode;
-	    }
-	}
-    }
-
-    # Set directory, packages extract to /usr/local.
-    chdir ($DIR_PREFIX);
-    $tar->setcwd ( cwd() );
-
     # Two cases where dirs to create are absolute paths: $MACOS_PERL and @sample dirs.
+    # Only directories that don't already exist are created and have their
+    # mode set; existing directories are left as they are.
     print "DEBUG: creating any required directories\n" if ($debug_flag);
     print "DEBUG: \@dirs_to_create = @dirs_to_create\n" if ($debug_flag);
     foreach $dir (@dirs_to_create) {
 	# Absolute paths (macOS perl modules under /Library/Perl, @sample dirs
 	# under /etc) are used as-is; relative paths live under /usr/local.
 	my $full_path = ($dir =~ m{^/}) ? $dir : "$DIR_PREFIX/$dir";
+	next if (-e $full_path);
 	make_path ($full_path, { error => \my $err });
 	if (@$err) {
 	    print "Couldn't create required directory. $! $full_path\n";
@@ -905,7 +1025,7 @@ sub minimal_pkg_add {
 	elsif ($debug_flag) {
 	    print "DEBUG: created dir $full_path (and any missing intermediates)\n";
 	}
-	
+
 	# Set mode on directory if we have one recorded
 	if (defined($dir_mode{$dir})) {
 	    apply_mode($dir_mode{$dir}, $full_path, 1);
@@ -940,18 +1060,18 @@ sub minimal_pkg_add {
 		    if ($substitute_linux) {
 			set_timestamp_and_gid ("$DIR_PREFIX/$substitute_extract{$substitute_file}", $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
-			if (defined($file_mode{$substitute_line})) {
+			if (defined($file_mode{$substitute_extract{$substitute_file}})) {
 			    my $full_path = "$DIR_PREFIX/$substitute_extract{$substitute_file}";
-			    apply_mode($file_mode{$substitute_line}, $full_path, 0);
+			    apply_mode($file_mode{$substitute_extract{$substitute_file}}, $full_path, 0);
 			}
 		    }
 		    if ($substitute_macos) {
 			# already an absolute path for macOS.
 			set_timestamp_and_gid ($substitute_extract{$substitute_file}, $file_ts{$substitute_file} // 0);
 			# Set mode on substituted file
-			if (defined($file_mode{$substitute_line})) {
+			if (defined($file_mode{$substitute_extract{$substitute_file}})) {
 			    my $full_path = $substitute_extract{$substitute_file};
-			    apply_mode($file_mode{$substitute_line}, $full_path, 0);
+			    apply_mode($file_mode{$substitute_extract{$substitute_file}}, $full_path, 0);
 			}
 		    }
 		}
@@ -1307,9 +1427,10 @@ sub minimal_pkg_delete {
 		$last_file_to_delete = $files_to_delete[-1];
 	    }
 	}
-	# @sample is already a full path.
+	# @sample is already a full path (after expanding ${SYSCONFDIR} etc.,
+	# which the registered +CONTENTS still contains, as on install).
 	elsif (/^\@sample (.*)$/) {
-	    $sample_file = $1;
+	    $sample_file = expand_pkg_vars ($1);
 
 	    if (!valid_filepath ($sample_file)) {
 		print "Warning: Invalid sample filepath in +CONTENTS, skipping: $sample_file\n";
@@ -1549,6 +1670,8 @@ sub minimal_pkg_delete {
 }
 
 # Extract contents of a signed package and return the contents list.
+# $file is the staged copy in the private temp dir (see stage_file), so the
+# file verified is the file extracted.
 sub verify_and_extract_package {
     my ($file) = @_;
     my ($tar, @fileobjs, $fileobj, $filedir, $filename);
@@ -1561,7 +1684,10 @@ sub verify_and_extract_package {
 
     # Now extract from file system root (/); previously using:
     #    system ($TAR, 'xfz', $file, '-C', '/');
-    chdir ('/');
+    if (!chdir ('/')) {
+	print "Cannot chdir to /. $! Could not extract $file.\n";
+	return;
+    }
     $tar = Archive::Tar->new;
     if (!$tar->read($file)) {
 	print "Couldn't read tar file $file. $!\n";
@@ -1833,7 +1959,9 @@ sub version_parse {
 	$portrevision = $4 if (defined ($4));
     }
     # yyyy[.]mmdd(alpha)(pN)(vN) (rsync-tools, p5-Time-modules)
-    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o]?)(p\d+)?(v\d+)?$/) {
+    # ([a-o])? not ([a-o]?): the latter captures '' (defined) when there is
+    # no alpha, which made any vN here die as "both an alpha patch and vN".
+    elsif ($version =~ /^(\d{4})\.*(\d{2})(\d{2})([a-o])?(p\d+)?(v\d+)?$/) {
 	$major = $1;
 	$minor = $2;
 	$patch = $3;
