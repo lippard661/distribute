@@ -9,6 +9,12 @@
 # Modified 17 May 2026 by Jim Lippard to not use bareword filehandles.
 # Modified 1 July 2026 by Jim Lippard after Claude Opus 4.8 review to
 #    fix minor issues and make error checking more robust.
+# Modified 15 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard to show a package the way OpenBSD's pkg_info does with no
+#    options (setopts('cdMR') in OpenBSD::PkgInfo, unchanged in 7.9 and
+#    8.0): "Required by:" from +REQUIRED_BY, sorted, between the comment
+#    and the description, and "Install notice:" from +DISPLAY after the
+#    description, each only if the file exists.
 
 use strict;
 use warnings;
@@ -100,26 +106,60 @@ sub list_all_brief {
     }
 }
 
+# Same sections, order and spacing as OpenBSD's pkg_info <pkg>: a header,
+# then each section's banner, its lines and a blank line, then a blank
+# line to end the package.
 sub show_package_desc {
     my ($package) = @_;
     my ($one_liner);
+    my $dir = "$PKG_DIR/$package";
 
-    unless (-d "$PKG_DIR/$package") {
+    unless (-d $dir) {
         warn "Skipping $package: not a package directory.\n";
         return;
     }
-    open (my $fh, '<', "$PKG_DIR/$package/+DESC") || die "Cannot open +DESC for package $package. $!\n";
+    open (my $fh, '<', "$dir/+DESC") || die "Cannot open +DESC for package $package. $!\n";
     $one_liner = <$fh>;
     $one_liner = '' unless defined ($one_liner);
     chomp ($one_liner);
     print "Information for inst:$package\n\n";
-    print "Comment:\n$one_liner\n\nDescription:\n";
+    print "Comment:\n$one_liner\n\n";
+
+    # Packages that depend on this one (written by pkg_add on OpenBSD).
+    if (-f "$dir/+REQUIRED_BY") {
+	print "Required by:\n";
+	print_file ("$dir/+REQUIRED_BY", 1);
+    }
+
+    print "Description:\n";
     while (<$fh>) {
 	chomp;
 	print "$_\n";
     }
     close ($fh);
+    print "\n";
 
-    # Just to be identical to pkg_info.
-    print "\n\n";
+    if (-f "$dir/+DISPLAY") {
+	print "Install notice:\n";
+	print_file ("$dir/+DISPLAY", 0);
+    }
+
+    # End of this package.
+    print "\n";
+}
+
+# Print a registration file's lines (sorted if asked), then a blank line.
+# Like pkg_info, a file that cannot be opened prints nothing at all.
+sub print_file {
+    my ($path, $sorted) = @_;
+
+    open (my $fh, '<', $path) || return;
+    my @lines = <$fh>;
+    close ($fh);
+    @lines = sort (@lines) if ($sorted);
+    foreach my $line (@lines) {
+	chomp ($line);
+	print "$line\n";
+    }
+    print "\n";
 }

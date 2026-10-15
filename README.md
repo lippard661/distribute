@@ -8,7 +8,9 @@ immutability management.
 
 Primary platform is OpenBSD. install.pl also runs on Linux and macOS for
 installing architecture-independent packages (Perl scripts and modules).
-distribute.pl runs on OpenBSD only (uses OpenBSD ports packages as source).
+distribute.pl is written for OpenBSD (its packages come from the OpenBSD
+ports packages directory); it has rsync paths for Linux and macOS but is
+largely untested there.
 
 Also included in this repo:
 - **gendoas.pl** — generates per-host doas.conf files from a shared template
@@ -18,9 +20,11 @@ Also included in this repo:
 
 The OpenBSD packages are signed with signify. To verify:
 ```
-signify -C -p discord.org-2026-pkg.pub -x install-<version>.tgz
-signify -C -p discord.org-2026-pkg.pub -x distribute-<version>.tgz
+signify -Vz -p discord.org-2026-pkg.pub -x install-<version>.tgz -m /dev/null
+signify -Vz -p discord.org-2026-pkg.pub -x distribute-<version>.tgz -m /dev/null
 ```
+(On Linux the command is `signify-openbsd`; on macOS with Homebrew,
+`signify`.)
 Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
 ## Overview
@@ -72,11 +76,12 @@ this can be overridden via `default-signing-key:` in the config or the
 before continuing, noting that plain/custom files signed with a
 non-standard key will require explicit user acceptance on the install side.
 Warns in December if next year's public key is not yet present. Aborts if
-the current year's signing key is missing.
+the selected signing key's secret or public key is missing from
+`/etc/signify`.
 
 **Command line**:
 ```
-distribute.pl [-4|-6|-p|-k keyname|-c config|-h hosts|-d] item [item ...]
+distribute.pl [-4|-6|-p|-k keyname|-c config|-h hosts|-d|-V] item [item ...]
 ```
 
 Options:
@@ -84,12 +89,15 @@ Options:
 -4          Use IPv4 for rsync (default)
 -6          Use IPv6 for rsync (for ip-address changes when IPv4 is down)
 -p          Sign with prior year's domain key (mutually exclusive with -k)
--k keyname  Sign with specified key (filename or filename.sec; key must
-            have its private key in /etc/signify). Overrides the default
-            signing key. Mutually exclusive with -p.
+-k keyname  Sign with specified key: a key name in /etc/signify (with or
+            without .sec, no path); both keyname.sec and keyname.pub must
+            exist there. Overrides the default signing key. Mutually
+            exclusive with -p.
 -c config   Use specified config file (default: /etc/distribute.conf)
--h hosts    Distribute only to specified hosts (comma-separated)
+-h hosts    Distribute only to specified hosts (comma-separated; each
+            must be in the config's host-list)
 -d          Debug output
+-V          Print version and exit
 ```
 
 Arguments are one or more named items from the config file.
@@ -99,12 +107,20 @@ Arguments are one or more named items from the config file.
 ### install.pl
 
 Runs on a target host. Looks for files in `/var/install/` (or
-`/var/installation/` on macOS, or /var/install/<hostname> (intended
-for when the target host is the sending host), verifies signatures,
-and installs. Integrates with syslock to unlock immutability flags
-before installation and re-lock afterward. Appends a record of what
-was installed to `/etc/CHANGELOG` (configurable to your own changelog
-location).
+`/var/installation/` on macOS), or in `/var/install/<hostname>` if that
+directory exists (intended for when the target host is the sending host),
+verifies signatures, and installs. Integrates with syslock to unlock
+immutability flags before installation and re-lock afterward. Appends a
+record of what was installed to `/etc/CHANGELOG` (set by `$CHANGELOG` in
+the script).
+
+Each file is first copied into a private temporary directory (symlinks
+and anything that is not a regular file are skipped), and that copy is
+the one verified and installed. If a plain/custom package cannot be
+extracted completely (for example, a file in it is still immutable),
+install.pl reports which entry failed, records the files that were
+installed in `/etc/CHANGELOG` as a partial install, leaves the package
+in the install directory, and exits 1.
 
 **Package types handled**:
 - `<hostname>-<date>-<time>-package.tgz` — plain/custom package created
@@ -112,22 +128,29 @@ location).
 - `<name>-<version>.tgz` — OpenBSD package; verified then installed via
   pkg_add (OpenBSD) or built-in minimal pkg_add (Linux/macOS)
 
-**Securelevel check**: on OpenBSD, install.pl checks kern.securelevel
-before attempting to unlock immutability flags. It will not run (unless
-`-f` is used) if securelevel > 0, since schg flags cannot be unlocked.
+**Securelevel check**: when syslock is in use on OpenBSD (or macOS or
+another BSD), install.pl checks kern.securelevel before attempting to
+unlock immutability flags. It will not run (unless `-f` is used) if
+securelevel > 0, since schg and sappnd flags cannot be cleared.
 Intended to run in single-user mode or on systems using only uchg flags.
 
 **Command line**:
 ```
-install.pl [-f|-n|-d]
+install.pl [-f|-n] [-k key] [-d] [-V]
 ```
 
 Options:
 ```
--f    Force: proceed even if securelevel > 0, assuming groups use uchg.
-      Uses syslock audit mode to verify groups are actually unlocked.
--n    No syslock: skip all immutability flag management
--d    Debug output
+-f      Force: proceed even if securelevel > 0, assuming groups use uchg.
+        Before unlocking anything, audits every group's schg and sappnd
+        members and aborts if any are locked.
+-n      No syslock: skip all immutability flag management (not with -f)
+-k key  Treat the named key in /etc/signify (name only, .pub/.sec
+        optional) as this year's key; if it is <domain>-<year>-pkg,
+        the domain is taken from it. Needed when the domain cannot be
+        derived from the hostname.
+-d      Debug output
+-V      Print version and exit
 ```
 
 install.pl takes no file arguments; it processes everything in the install
@@ -154,22 +177,29 @@ uses comment-based directives to mark which sections apply to which hosts:
 `hosts:` values can be `all`, `none`, a space-separated list of hostnames,
 or `all except` followed by a list. Lines beginning with `# permit` or
 `# deny` are uncommented when included; continuation lines (ending with
-`\`) are handled correctly.
+`\`) must themselves be comments and are uncommented with them. Every
+template line must be a comment or blank; gendoas.pl refuses anything
+else.
 
-gendoas.pl reads from `/etc/doas.conf.template` by default and writes to
-`doas.conf` in the current directory (use `-o` to specify output path).
-On the local host it also installs directly to `/etc/doas.conf` with a
-backup. Specifying a hostname argument generates a config for that host
-instead of the local host.
+gendoas.pl reads `/etc/doas.conf.template` and writes:
+- with `-o file`: that file, for any host (it refuses a path under `/etc`);
+- with no `-o`, for the local host: `/etc/doas.conf`, keeping its mode
+  and saving the previous file as `/etc/doas.conf.bak`;
+- with no `-o`, for another host: `doas.conf` in the current directory.
+
+The hostname argument selects the host (default: the local host). If
+`doas` is installed, the result is checked with `doas -C` before it is
+written. Files written with `-o` or for another host are mode 0600.
 
 Uses pledge/unveil on OpenBSD.
 
 ```
-gendoas.pl [-o output_file] [hostname]
+gendoas.pl [-V] [-o output_file] [hostname]
 ```
 
-distribute.pl invokes gendoas.pl automatically for each target host when
-distributing the `doas.conf` custom type.
+distribute.pl invokes gendoas.pl (with `-o`) for each target host when
+distributing the `doas.conf` custom type, including the local host,
+which needs gendoas.pl 1.6 or later (distribute.pl checks).
 
 ---
 
@@ -178,11 +208,14 @@ distributing the `doas.conf` custom type.
 A minimal pkg_info equivalent for Linux and macOS, working with the
 `/var/db/pkg` package registration database created by install.pl's
 built-in minimal pkg_add. Lists installed packages or shows details for
-a specific package, using the same output format as OpenBSD's pkg_info.
+specific packages, in the same format as OpenBSD's pkg_info with no
+options: the comment, the packages that require it (`+REQUIRED_BY`, if
+present), the description, and the install notice (`+DISPLAY`, if
+present).
 
 ```
-pkg_info.pl              # list all installed packages (brief)
-pkg_info.pl <package>    # show description for package
+pkg_info.pl                  # list all installed packages (brief)
+pkg_info.pl <package> ...    # show details for each package
 ```
 
 ## Configuration: distribute.conf
@@ -193,7 +226,7 @@ Default location: `/etc/distribute.conf`
 
 ```
 # Macro definitions (usable in any field value as %%MACRONAME%%)
-GENDOAS="/usr/local/bin/gendoas.pl"
+GENDOAS="/usr/local/sbin/gendoas.pl"
 
 # All hosts distribute.pl knows about
 host-list: host1, host2, host3
@@ -214,11 +247,15 @@ pkg-dir: /usr/ports/packages/amd64/all
 ```
 name: <item-name>        # used on distribute.pl command line
 file: <source-path>      # source file or package name (<name>-PKG for packages)
-dest: <dest-path>        # optional; destination path if different from source
+dest: <dest-path>        # optional; absolute destination path if different
+                         # from source; not allowed for packages
 type: plain|package|custom
-syslock-groups: <groups> # optional; comma-separated syslock groups to unlock
-hosts: all|host1,host2|all except host3
+syslock-groups: <groups> # optional; comma-separated, from syslock-groups-list
+hosts: all|host1,host2|all except host3   # names from host-list
 ```
+
+For the `ip-address` and `ipv6-prefix` custom types, `file:` and `dest:`
+are comma-separated lists that pair up one to one.
 
 For `custom` type only:
 ```
@@ -227,19 +264,32 @@ unveil-exec: <path>[,<path>]     # paths to unveil for execution
 custom-vars: key=value[,key=value]  # variables passed to custom handler
 ```
 
-**Special variables** usable in `file:` and `dest:` fields:
-- `$SIGNIFY_PUB_KEY` — current year's signify public key path
-- `$SIGNIFY_PUB_KEY_NEXT` — next year's signify public key path
-- `$HOST` — target hostname (substituted per-host at distribution time;
-  useful in `file:` for ip-address custom type to pull per-host source
-  files from backup directories)
+Custom variables for each custom type (any other name is an error):
+
+| type | required | optional |
+|---|---|---|
+| `doas.conf` | `gendoas` | |
+| `ip-address` | `wan0`, `dns` | `wan1`, `wan0-host-fqdn`, `wan1-host-fqdn`, `ipv6-name`, `ipv6-type`, `ipv6-endpoint`, `require-source-dir`, `skip-files`, `only-files` |
+| `ipv6-prefix` | `wan0` | `wan1`, `wan0-prefix-file`, `wan1-prefix-file`, `require-source-dir`, `skip-files`, `only-files` |
+
+**Special variables**:
+- `$SIGNIFY_PUB_KEY` and `$SIGNIFY_PUB_KEY_NEXT` — the current and next
+  year's signify public key paths. Recognized only as the entire value of
+  `file:` or `dest:`, and only in items named `<domain>-pkg.pub-current`
+  and `<domain>-pkg.pub-next` respectively.
+- `$HOST` — target hostname, substituted per host in the `file:` list of
+  the `ip-address` and `ipv6-prefix` custom types, to pull per-host source
+  files from backup directories. A source without `$HOST` is used for
+  every host.
 
 Macros defined with `MACRONAME = "value"` can be referenced as
 `%%MACRONAME%%` in any field value.
 
 **Package name convention**: packages are specified as `<name>-PKG` in
 the `file:` field; distribute.pl finds the latest version of that package
-in the configured packages directory.
+in the configured packages directory. A `-no_<flavor>` suffix is ignored
+when comparing versions; if the newest version exists in more than one
+flavor, distribute.pl stops rather than guess.
 
 ## Signify Key Conventions
 
@@ -268,13 +318,18 @@ Continue with non-standard signing key? [y/n]:
 
 **distribute.pl** accepts packages from any source for distribution,
 provided the signing key's public key is present in `/etc/signify` and
-follows the `-pkg` naming convention for the current or prior year.
+is named `<name>-<year>-pkg` with a year no earlier than last year, or,
+on OpenBSD, `openbsd-<NN>-pkg` for the current or previous release.
+(Keys other than this year's domain key were refused by mistake before
+distribute.pl 1.10 and install.pl 1.9.)
 
 **install.pl** applies different trust levels depending on content type:
 
 For **packages** (OpenBSD `.tgz` files installed via pkg_add or the
-built-in minimal pkg_add): any valid `-pkg` key in `/etc/signify` for
-the current or prior year is accepted without prompting. Package signing
+built-in minimal pkg_add): any `<name>-<year>-pkg` key in `/etc/signify`
+with a year no earlier than last year, or on OpenBSD an
+`openbsd-<NN>-pkg` key for the current or previous release, is accepted
+without prompting. Package signing
 is an independent process; the distribution key acts as a transport
 signature and packages may legitimately originate from multiple sources.
 
@@ -287,7 +342,7 @@ in `/etc/signify` — trigger an explicit confirmation prompt:
 ======================================================================
 SIGNATURE VERIFICATION WARNING
 ======================================================================
-File is signed with: otherdomain.com-2026-pkg.sec
+File is signed with:  otherdomain.com-2026-pkg.sec
 Expected signing key: example.com-2026-pkg.sec
 
 The signing key is valid and in /etc/signify,
@@ -323,9 +378,10 @@ The minimal pkg_add:
   used as the default config instead of the OpenBSD one
 - Creates `/var/db/pkg/<package>/` registration entries (+CONTENTS, +DESC,
   +DISPLAY) compatible with OpenBSD's pkg database format
-- On upgrade, runs minimal pkg_delete on the old version first, preserving
-  any sample config files that have been modified from the installed version
-  (checked by size and SHA256)
+- On upgrade, checks the new package's `+CONTENTS` first, then runs
+  minimal pkg_delete on the old version, preserving any sample config
+  files that have been modified from the installed version (checked by
+  size and SHA256)
 - Respects `@mode` settings in `+CONTENTS` for file and directory permissions
 - Will not install the same version again or downgrade in place
 
@@ -357,19 +413,21 @@ rrsync and rsync-client/server infrastructure used on the remote end.
 
 ## syslock Integration
 
-distribute.pl sends a signed `.grp` file alongside plain and custom
-packages listing the syslock groups that need to be unlocked for
-installation. install.pl reads and verifies this file, then calls
-`sysunlock -g <group>` for each group before installing and
-`syslock -g <group>` after.
+distribute.pl sends a signed `.grp` file alongside each plain/custom
+package, and alongside each package whose config entry has
+`syslock-groups:`, listing the syslock groups that need to be unlocked
+for installation. install.pl reads and verifies this file, then, for
+each group that has locked files (`sysunlock -g <group> -a -o -q`), calls
+`sysunlock -g <group>` before installing and `syslock -g <group>` after.
 
-For packages, install.pl assumes the `etc` and `local` syslock groups
-(covering `/etc` and `/usr/local`).
+The `local` syslock group (covering `/usr/local`) is always included.
 
 The `-f` flag allows install.pl to proceed when securelevel > 0,
 assuming the relevant groups use uchg flags (which can be unlocked
-without single-user mode). It uses `sysunlock -a -q -g <group>` to
-audit that groups are actually unlocked after the sysunlock call.
+without single-user mode). Before unlocking anything, it audits each
+group's schg and sappnd members (`sysunlock -g <group>:schg -a -q`, and
+the same for sappnd) and aborts if any are locked, re-running the audit
+without `-q` so the output shows what it found.
 
 See [syslock](https://github.com/lippard661/syslock) for group
 configuration and flag management.
@@ -382,13 +440,13 @@ Two packages are provided:
 
 **install** (install.pl + pkg_info.pl):
 ```
-pkg_add ./install-1.0.tgz                    # OpenBSD
+pkg_add ./install-<version>.tgz              # OpenBSD
 ```
 Or using install.pl on OpenBSD, Linux, or macOS once it is itself installed.
 
 **distribute** (distribute.pl + gendoas.pl):
 ```
-pkg_add ./distribute-1.0.tgz                 # OpenBSD
+pkg_add ./distribute-<version>.tgz           # OpenBSD
 ```
 The default distribute.conf included with the package references the
 installed path for gendoas.pl automatically.
@@ -410,14 +468,14 @@ cp src/install.pl /usr/local/sbin/install.pl
 chmod 755 /usr/local/sbin/install.pl
 
 # gendoas.pl — on the distribution server
-cp src/gendoas.pl /usr/local/bin/gendoas.pl
-chmod 755 /usr/local/bin/gendoas.pl
-cp etc/doas.conf.template /etc/doas.conf.template
-chmod 600 /etc/doas.conf.template
+cp src/gendoas.pl /usr/local/sbin/gendoas.pl
+chmod 755 /usr/local/sbin/gendoas.pl
+# then write your own /etc/doas.conf.template (no template is included)
+# and chmod 600 it
 
 # pkg_info.pl — on Linux or macOS hosts
-cp src/pkg_info.pl /usr/local/bin/pkg_info.pl
-chmod 755 /usr/local/bin/pkg_info.pl
+cp src/pkg_info.pl /usr/local/sbin/pkg_info.pl
+chmod 755 /usr/local/sbin/pkg_info.pl
 
 # Create install directory on each managed host
 mkdir -p /var/install        # OpenBSD/Linux
@@ -426,38 +484,43 @@ mkdir -p /var/installation   # macOS
 
 ### Dependencies
 
-**distribute.pl** (intended for OpenBSD but will run on Linux, macOS):
-- Perl 5
-- Archive::Tar, File::Basename, File::Copy, File::Path, Getopt::Std,
-  IO::Uncompress::Gunzip, POSIX, Sys::Hostname (standard)
-- [Signify.pm](https://github.com/lippard661/Signify)
+**distribute.pl** (written for OpenBSD; largely untested on Linux, macOS):
+- Perl 5.10 or later
+- Archive::Tar, File::Basename, File::Copy, File::Path, File::Spec,
+  Getopt::Std, IO::Uncompress::Gunzip, POSIX, Socket, Sys::Hostname
+  (standard); File::Temp (standard; not on OpenBSD)
+- [Signify.pm](https://github.com/lippard661/Signify) 1.3 or later
 - OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil (OpenBSD standard)
 
 **install.pl** (OpenBSD, Linux, macOS):
-- Perl 5
+- Perl 5.10 or later
 - Archive::Tar, Cwd, Fcntl, File::Basename, File::Copy, File::Path,
-  Getopt::Std, IO::Uncompress::Gunzip, POSIX, Sys::Hostname (standard)
+  Getopt::Std, IO::Uncompress::Gunzip, POSIX, Sys::Hostname (standard);
+  File::Temp (standard; not on OpenBSD)
 - Digest::SHA (standard; used on Linux and macOS for pkg_delete)
-- [Signify.pm](https://github.com/lippard661/Signify)
+- [Signify.pm](https://github.com/lippard661/Signify) 1.3 or later
 - OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil (OpenBSD only)
 
 **gendoas.pl** (OpenBSD, Linux, macOS):
 - Perl 5
-- File::Basename, File::Copy, File::Temp, Getopt::Std, Sys::Hostname
-  (standard)
+- File::Basename, File::Copy, File::Spec, File::Temp, Getopt::Std,
+  Sys::Hostname (standard)
 - OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil (OpenBSD only)
+- doas (optional; used to check the generated file)
 
 ## Security Notes
 
 - `/etc/distribute.conf` should be mode 0600 (root only); it reveals
   your host topology, sync relationships, and file locations
-- distribute.pl and install.pl are mode 0755; both require and verify
-  that they are run as root
+- distribute.pl and install.pl are mode 0755; install.pl refuses to run
+  except as root, and distribute.pl needs read access to the signing key
+  (normally root-only)
 - The signing key secret file should be 0600 and its passphrase stored
   securely off the distribution server (see Key Security above)
-- install.pl verifies signatures twice for OpenBSD packages installed
-  via the built-in minimal pkg_add: once before reading the tar file and
-  once after, to mitigate TOCTOU race conditions
+- install.pl never verifies a file and then reads it again by name: each
+  file is copied from the install directory into a private 0700
+  temporary directory (symlinks and non-regular files are refused), and
+  that copy is both verified and installed
 - Sample config files that have been modified since installation are
   preserved during package upgrades; modification is detected by both
   size and SHA256 comparison
@@ -475,7 +538,7 @@ mkdir -p /var/installation   # macOS
   and verification
 - [reportnew](https://github.com/lippard661/reportnew) — monitor _rsyncu
   activity and installation events via process accounting
-- [sigtree](https://github.com/lippard661/sigtree) — file integrity
+- [sigtree](https://github.com/lippard661/sigtree.pl) — file integrity
   monitoring detects any unexpected changes after installation
 
 ## Author

@@ -152,6 +152,25 @@
 #    fix yyyy.mmdd+vN version parsing; check chdir; write CHANGELOG before
 #    re-locking; reject paths in -k; validate .grp group names; require
 #    /usr/bin/perl on macOS.
+# Modified 15 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.9): use Signify.pm 1.3's named-argument calls
+#    (verify_gzip in verify_signature, the same change as distribute.pl,
+#    and verify for .grp files) and require Signify.pm 1.3. Fix two
+#    defects in verify_signature that made the fallback to a key other
+#    than this year's always fail: fileparse's return values were taken
+#    in the wrong order, so the second verification required a public
+#    key named "./"; and a header key path in /etc/signify was compared
+#    without fileparse's trailing slash. Packages signed with last year's
+#    key, an OpenBSD key, or another <domain>-<year>-pkg key in
+#    /etc/signify were refused since 1 January 2026. A plain/custom
+#    package that stops extracting part way (an entry that cannot be
+#    written) is now reported, recorded in CHANGELOG as partially
+#    installed, left in place, and makes install.pl exit 1; previously the
+#    files before the failing entry were installed silently and it said
+#    nothing could be installed. unveil: no x on the install locations,
+#    the install dir or /tmp (nothing is run from them), no unveil of
+#    sysctl (run only before pledge); comments say why /dev/null and
+#    /bin/pwd are unveiled.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -164,7 +183,9 @@ use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp );
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 use POSIX qw(strftime);
-use Signify;
+# 1.3 or later: the named-argument calls below are read by older versions
+# as positional arguments (a hash reference as the public key or temp dir).
+use Signify 1.3;
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -177,7 +198,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.8 of 10 October 2026.';
+my $VERSION = 'install.pl version 1.9 of 15 October 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -275,8 +296,8 @@ my %PKG_VARS = (
 ### Variables.
 
 my ($securelevel, $host, $domain, $syslock_group, @files, $file,
-    $user, $date, @changelog_entry, @contents, $line,
-    $installed_something, $temp_dir);
+    $user, $date, @changelog_entry, $line,
+    $installed_something, $extract_failed, $temp_dir);
 my (@grp_files, @errors);
 my %opts;
 my $custom_key_option;
@@ -452,30 +473,36 @@ if ($^O eq 'openbsd') {
     # Unveil /.
     unveil ('/', 'r');
     
-    # Unveil for installation.
+    # Unveil for installation. No 'x': unveil's x is checked only when
+    # execve(2) names a path, nothing is run from these trees except
+    # syslock/sysunlock (unveiled below), and pkg_add, once exec'd, runs
+    # without our pledge and unveil.
     foreach $location_dir (@DEST_LOCATIONS) {
-	unveil ($location_dir, 'rwxc');
+	unveil ($location_dir, 'rwc');
     }
     
-    # Unveil commands used.
+    # Unveil commands used after this point. (sysctl and uname run only
+    # before pledge, so they need no unveil.)
     unveil ($PKG_ADD, 'rx');
-    unveil ($PWD, 'rx'); # not sure what calls this
+    unveil ($PWD, 'rx'); # Cwd::cwd() runs /bin/pwd (Archive::Tar setcwd)
     unveil ($SIGNIFY, 'rx');
-    unveil ($SYSCTL, 'rx');
     unveil ($SYSLOCK, 'rwxc') if ($use_syslock); # could update!
     unveil ($SYSUNLOCK, 'rwxc') if ($use_syslock); # could update!
 
     # Unveil signify pub key dir (could also update!)
     unveil ($SIGNIFY_PUB_KEY_DIR, 'rwc');
-    # Unveil for Signify gzip verification.
+    # For Signify gzip verification: its forked child opens /dev/null for
+    # writing with open(2). Since OpenBSD 7.9 only libc's __pledge_open(2)
+    # bypasses unveil for /dev/null, so this unveil is required ('c'
+    # because '>' opens with O_CREAT).
     unveil ('/dev/null', 'rwc');
 
     # Unveil files modified.
-    unveil ($INSTALL_DIR, "rwxc");
+    unveil ($INSTALL_DIR, 'rwc');
     unveil ($CHANGELOG, 'rwc');
 
-    # Unveil /tmp.
-    unveil ('/tmp', 'rwxc');
+    # Unveil /tmp (staging and temp files; nothing is run from it).
+    unveil ('/tmp', 'rwc');
 
     # No more unveiling.
     unveil ();
@@ -513,8 +540,8 @@ if ($use_syslock) {
 	    my $staged_sig = stage_file ("$INSTALL_DIR/$file.sig");
 	    # Verify.
 	    if ($staged_grp && $staged_sig &&
-		(Signify::verify ($staged_grp, $SIGNIFY_PUB_KEY) ||
-		 Signify::verify ($staged_grp, $PRIOR_SIGNIFY_PUB_KEY))) {
+		(Signify::verify ($staged_grp, { public_key_path => $SIGNIFY_PUB_KEY }) ||
+		 Signify::verify ($staged_grp, { public_key_path => $PRIOR_SIGNIFY_PUB_KEY }))) {
 		open (my $fh, '<', $staged_grp) || die "Cannot open syslock group file. $! $staged_grp\n";
 		while (<$fh>) {
 		    chomp;
@@ -632,17 +659,34 @@ foreach $file (@files) {
     if ($file =~ /^\Q$host\E-\d+-\d+-package\.tgz$/) {
 	my $staged = stage_file ("$INSTALL_DIR/$file");
 	next unless ($staged);
-	@contents = verify_and_extract_package ($staged);
+	my ($extracted, $extract_error) = verify_and_extract_package ($staged);
 	# Remove file and create CHANGELOG entry if successfully installed.
-	if ($contents[0]) {
+	if (defined ($extracted) && !defined ($extract_error) && @$extracted) {
 	    unlink ("$INSTALL_DIR/$file");
 	    # Create CHANGELOG entry.
 	    push (@changelog_entry, "\tInstalled package $file:");
-	    foreach $line (@contents) {
+	    foreach $line (@$extracted) {
 		push (@changelog_entry, $line);
 	    }
 
 	    $installed_something = 1;
+	}
+	elsif (defined ($extract_error)) {
+	    # Archive::Tar stops at the first entry it cannot write, after
+	    # writing every entry before it. Record what did change, and
+	    # leave the package in place so it can be retried.
+	    $extract_failed = 1;
+	    print "ERROR: extraction of $file stopped part way: $extract_error\n";
+	    print "ERROR: $file left in $INSTALL_DIR; " .
+		(@$extracted ? scalar (@$extracted) . " earlier file(s) from it were installed.\n"
+		 : "nothing from it was installed.\n");
+	    if (@$extracted) {
+		push (@changelog_entry, "\tPARTIALLY installed package $file (stopped: $extract_error):");
+		foreach $line (@$extracted) {
+		    push (@changelog_entry, $line);
+		}
+		$installed_something = 1;
+	    }
 	}
     }
     elsif ($file =~ /^([\w\-]+-[\.\w]+)\.tgz$/ || $file =~ /^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/) {
@@ -691,9 +735,16 @@ rmtree ($temp_dir);
 
 # End if we didn't install anything.
 if (!$installed_something) {
+    if ($extract_failed) {
+	print "Nothing was installed (see errors above).\n";
+	exit 1;
+    }
     print "Didn't find any files that could be installed.\n";
     exit;
 }
+
+# A package that stopped part way leaves the system in a mixed state.
+exit 1 if ($extract_failed);
 
 ### Subroutines.
 
@@ -1669,7 +1720,10 @@ sub minimal_pkg_delete {
     return 1;
 }
 
-# Extract contents of a signed package and return the contents list.
+# Extract contents of a signed package. Returns (\@lines, $error): the
+# CHANGELOG lines for the entries written and, if extraction stopped part
+# way, the error (undef on success). Returns an empty list if the package
+# was not verified or could not be read, in which case nothing was written.
 # $file is the staged copy in the private temp dir (see stage_file), so the
 # file verified is the file extracted.
 sub verify_and_extract_package {
@@ -1695,17 +1749,27 @@ sub verify_and_extract_package {
     }
     $tar->setcwd ( cwd() );
     print "DEBUG: extracting tar file $file\n" if ($debug_flag);
-    @fileobjs = $tar->extract();
-    
-    # Indent each filename line with a tab, three spaces, and a leading slash.
+
+    # One entry at a time, in archive order, so that if one cannot be
+    # written (an immutable file whose syslock group was not unlocked,
+    # say) we know which entries before it were. Archive::Tar's own
+    # extract() stops at the first failure and returns nothing, which
+    # made a partial install look like nothing installed.
+    @fileobjs = $tar->get_files;
     foreach $fileobj (@fileobjs) {
+	if (!$tar->extract ($fileobj)) {
+	    my $error = $tar->error || 'unknown error';
+	    $error =~ s/\s+\z//;
+	    return (\@output, $error);
+	}
+	# Indent each filename line with a tab, three spaces, and a leading slash.
 	$filedir = $fileobj->prefix;
 	$filename = $fileobj->name;
 	$line = "\t" . $THREE_SPACES . '/' . $filedir . '/' . $filename;
 	push (@output, $line);
     }
 
-    return (@output);
+    return (\@output, undef);
 }
 
 # Subroutine to expand package variables.
@@ -1770,9 +1834,10 @@ sub verify_signature {
     
     print "DEBUG: Verifying " . ($is_package ? "package" : "plain/custom") . ": $gzip_path\n" if ($debug_flag);
 
-    ($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir,
-						 "$SIGNIFY_KEY_NAME.pub",
-						 $SIGNIFY_SEC_KEY);
+    ($signer, $signdate) = Signify::verify_gzip ($gzip_path,
+						 { temp_dir => $temp_dir,
+						   require_public_key_file => "$SIGNIFY_KEY_NAME.pub",
+						   require_secret_key_path => $SIGNIFY_SEC_KEY });
     @errors = Signify::signify_error;
     
     if (!@errors) {
@@ -1781,8 +1846,13 @@ sub verify_signature {
     }
     
     elsif ($errors[0] =~ /public key is \"(.*)\" but/) {
-	(my $pubkey_dir, $public_key) = fileparse ($1); # $pubkey_dir ignored, no longer present anymore
-	($signer, $signdate) = Signify::verify_gzip ($gzip_path, $temp_dir, $public_key);
+	# fileparse returns the file name first. (Before install.pl 1.9 and
+	# distribute.pl 1.10 this took the directory, "./", so the second
+	# verification below could never succeed.)
+	($public_key) = fileparse ($1);
+	($signer, $signdate) = Signify::verify_gzip ($gzip_path,
+						     { temp_dir => $temp_dir,
+						       require_public_key_file => $public_key });
 	@errors = Signify::signify_error;
 	
 	if (@errors) {
@@ -1791,7 +1861,9 @@ sub verify_signature {
 	}
 	
 	($signer_key_file, $signer_key_dir) = fileparse ($signer);
-	if ($signer_key_dir ne $SIGNIFY_PUB_KEY_DIR && $signer_key_dir ne './') {
+	# fileparse leaves the trailing slash on the directory. A bare key
+	# name (signify since OpenBSD 7.8) gives './'.
+	if ($signer_key_dir ne "$SIGNIFY_PUB_KEY_DIR/" && $signer_key_dir ne './') {
 	    print "Not signed by a key in $SIGNIFY_PUB_KEY_DIR, signed by $signer.\n";
 	    return 0;
 	}
