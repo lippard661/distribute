@@ -171,6 +171,18 @@
 #    the install dir or /tmp (nothing is run from them), no unveil of
 #    sysctl (run only before pledge); comments say why /dev/null and
 #    /bin/pwd are unveiled.
+# Modified 18 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.9a): when an OpenBSD package that isn't already
+#    installed is waiting, also unlock the groups in
+#    @PACKAGE_SYSLOCK_GROUPS ("etcdir", for the /etc directory itself,
+#    since pkg_add and @sample files can create or replace files directly
+#    in /etc), but only if this host's syslock.conf defines them, so
+#    distribute.pl need not send a .grp (and ask for a passphrase) for
+#    packages. (The "etc" package default in the 20 November 2024 entry
+#    was later removed; "local" is the only group unlocked for every
+#    install.) An extraction that fails with EPERM now says the file or
+#    its directory may still be immutable: Archive::Tar replaces a file by
+#    unlinking and recreating it, so the directory must be unlocked too.
 use strict;
 use warnings;
 use Archive::Tar;
@@ -198,7 +210,7 @@ if ($^O eq 'darwin' || $^O eq 'linux') {
 
 ### Constants.
 
-my $VERSION = 'install.pl version 1.9 of 15 October 2026.';
+my $VERSION = 'install.pl version 1.9a of 18 October 2026.';
 
 my $INSTALL_DIR = '/var/install';
 $INSTALL_DIR = '/var/installation' if ($^O eq 'darwin');
@@ -214,6 +226,19 @@ my @DEST_LOCATIONS = (
 my @SYSLOCK_GROUPS = (
     'local'
     );
+
+# Also unlocked when an OpenBSD package (not a plain/custom package) is
+# waiting to be installed, if this host's syslock.conf defines the group:
+# pkg_add, and the minimal pkg_add's @sample files, can create or replace
+# files directly in /etc, which needs the /etc directory itself unlocked.
+my @PACKAGE_SYSLOCK_GROUPS = (
+    'etcdir'
+    );
+
+# OpenBSD package file names (with an optional -no_<flavor>), used by
+# both the main loop and the check for @PACKAGE_SYSLOCK_GROUPS.
+my $PKG_FILE_RE = qr/^([\w\-]+-[\.\w]+)\.tgz$/;
+my $PKG_FLAVOR_FILE_RE = qr/^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/;
 
 my $PKG_ADD = '/usr/sbin/pkg_add';
 my $PWD = '/bin/pwd';
@@ -572,6 +597,22 @@ die "Nothing to install.\n" if (!$files[0]);
 $host = hostname();
 ($host, $domain) = split (/\./, $host, 2);
 
+# Add @PACKAGE_SYSLOCK_GROUPS if a package that isn't already installed is
+# waiting. Only groups this host's syslock.conf defines: syslock dies on an
+# unknown group, which would abort the install (hosts without one, such as
+# some Linux and macOS hosts, are skipped).
+if ($use_syslock && grep { package_pending ($_) } @files) {
+    my %defined = syslock_conf_groups ();
+    foreach my $group (@PACKAGE_SYSLOCK_GROUPS) {
+	if (!$defined{$group}) {
+	    print "DEBUG: package group $group not defined in $SYSLOCK_CONF, not unlocking it\n" if ($debug_flag);
+	    next;
+	}
+	push (@SYSLOCK_GROUPS, $group) unless (grep { $_ eq $group } @SYSLOCK_GROUPS);
+    }
+    print "DEBUG: syslock_groups = @SYSLOCK_GROUPS\n" if ($debug_flag);
+}
+
 # Get date for CHANGELOG entry and get that started.
 $date = strftime ("%Y-%m-%d", localtime (time()));
 push (@changelog_entry, "$date-$user:");
@@ -689,7 +730,7 @@ foreach $file (@files) {
 	    }
 	}
     }
-    elsif ($file =~ /^([\w\-]+-[\.\w]+)\.tgz$/ || $file =~ /^([\w\-]+-[\.\w]+-no_\w+)\.tgz$/) {
+    elsif ($file =~ $PKG_FILE_RE || $file =~ $PKG_FLAVOR_FILE_RE) {
 	my $pkg_name = $1;
 	if (-d "/var/db/pkg/$pkg_name") {
 	    print "Package $file already installed per existence of directory /var/db/pkg/$pkg_name.\n";
@@ -756,6 +797,30 @@ END {
     local $?;
     relock_groups() if ($use_syslock && %unlocked_by_us);
     rmtree ($temp_dir) if (defined ($temp_dir) && -d $temp_dir);
+}
+
+# True if $file is an OpenBSD package (not this host's plain/custom
+# package) that the main loop would install: same patterns, and not
+# already registered in /var/db/pkg.
+sub package_pending {
+    my ($file) = @_;
+    return 0 if ($file =~ /^\Q$host\E-\d+-\d+-package\.tgz$/);
+    return 0 unless ($file =~ $PKG_FILE_RE || $file =~ $PKG_FLAVOR_FILE_RE);
+    return (!-d "/var/db/pkg/$1");
+}
+
+# Group names defined by "group:" lines in syslock.conf (the same line
+# syntax syslock parses; a trailing "# comment" is ignored).
+sub syslock_conf_groups {
+    my %groups;
+    open (my $fh, '<', $SYSLOCK_CONF) || return %groups;
+    while (my $line = <$fh>) {
+	next unless ($line =~ /^group:\s+(.*)$/);
+	(my $names = $1) =~ s/#.*//;
+	$groups{$_} = 1 foreach (split (' ', $names));
+    }
+    close ($fh);
+    return %groups;
 }
 
 # Subroutine to relock syslock groups. A failed re-lock is reported loudly,
@@ -1758,8 +1823,14 @@ sub verify_and_extract_package {
     @fileobjs = $tar->get_files;
     foreach $fileobj (@fileobjs) {
 	if (!$tar->extract ($fileobj)) {
+	    my $eperm = $!{EPERM};   # capture before anything else sets $!
 	    my $error = $tar->error || 'unknown error';
 	    $error =~ s/\s+\z//;
+	    # Archive::Tar replaces a file by unlinking it and creating a new
+	    # one, so an immutable directory fails even when the file itself
+	    # was unlocked.
+	    $error .= " (operation not permitted: the file or its directory may still be immutable;"
+		. " check that syslock groups covering both were unlocked)" if ($eperm);
 	    return (\@output, $error);
 	}
 	# Indent each filename line with a tab, three spaces, and a leading slash.
